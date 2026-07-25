@@ -21,6 +21,17 @@ _LOUDNESS_TARGET_DBFS = -20.0
 _LOUDNESS_GAIN_MIN_DB = -3.0
 _LOUDNESS_GAIN_MAX_DB = 3.0
 
+# Chunked (streaming/causal) codec encode. Encoding a full reference in a
+# single forward materializes the entire encoder activation/attention state
+# at once and spikes VRAM (~19 GB on a ~30 s clip on the shared GPU). The
+# MOSS-Audio-Tokenizer-v2 encoder natively supports the same streaming path
+# the vocoder decode already uses (chunk_duration=8): 8 s * 48000 Hz
+# sampling_rate = 384000 samples, exactly divisible by the 3840
+# downsample_rate (= 100 code frames), so the per-forward footprint stays
+# bounded regardless of reference length while the codes are identical to an
+# unchunked encode.
+_ENCODE_CHUNK_DURATION_S = 8.0
+
 
 class MossTTSLocalAudioTokenizer:
     """Encode wrapper around a separately loaded MOSS-Audio-Tokenizer-v2 model."""
@@ -92,6 +103,7 @@ class MossTTSLocalAudioTokenizer:
             encoded = self.model.batch_encode(
                 prepared,
                 num_quantizers=int(num_quantizers),
+                chunk_duration=_ENCODE_CHUNK_DURATION_S,
             )
         audio_codes = encoded.audio_codes
         audio_codes_lengths = encoded.audio_codes_lengths
