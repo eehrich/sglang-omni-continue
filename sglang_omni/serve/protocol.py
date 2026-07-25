@@ -325,6 +325,27 @@ class SpeechReference(BaseModel):
     ref_codes: dict[str, Any] | list[Any] | None = None
 
 
+class EncodeReferenceRequest(BaseModel):
+    """MOSS-TTS Local: encode reference audio into ``ref_codes`` (POST /moss/encode_reference).
+
+    ``audio`` is one data URI or a list of them. The codes come back in the
+    exact wire form ``metadata.tts_params.ref_codes`` accepts, so a caller can
+    encode a voice/segment once and then reuse (and concatenate) the codes on
+    every later request instead of re-shipping and re-encoding the audio.
+    """
+
+    audio: str | list[str]
+    timeout_s: float | None = None
+
+
+class EncodeReferenceResponse(BaseModel):
+    """Packed codes, in request order, plus the codec geometry."""
+
+    codes: list[dict[str, Any]]
+    n_vq: int
+    frames_per_second: float
+
+
 class CreateSpeechRequest(BaseModel):
     """OpenAI-compatible text-to-speech request.
 

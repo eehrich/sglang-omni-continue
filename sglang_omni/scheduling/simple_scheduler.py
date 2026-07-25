@@ -41,6 +41,7 @@ class SimpleScheduler:
         max_batch_cost: int | None = None,
         max_concurrency: int = 1,
         abort_callback: Callable[[str], None] | None = None,
+        admin_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
@@ -64,6 +65,13 @@ class SimpleScheduler:
                 "max_concurrency > 1 and batch_compute_fn are mutually exclusive"
             )
         self._abort_callback = abort_callback
+        # Optional control-plane hook. Stage.runtime probes ``scheduler.admin``
+        # with getattr and reports "stage does not support admin operations"
+        # when it is absent, so the attribute is only defined when a stage
+        # actually supplies a handler -- a SimpleScheduler without one keeps
+        # the old (unsupported) answer instead of newly claiming support.
+        if admin_handler is not None:
+            self.admin = admin_handler  # type: ignore[method-assign]
         self._aborted: set[str] = set()
         self._abort_lock = threading.Lock()
         self._running = False

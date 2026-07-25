@@ -40,13 +40,23 @@ from typing import Any
 
 import torch
 
+from sglang_omni.proto.admin import ADMIN_MOSS_ENCODE_REFERENCE
+
 REF_CODES_PARAM = "ref_codes"
+
+# Admin control-plane action that encodes audio into this wire form using the
+# codec the preprocessing stage already holds. Defined in proto.admin (with the
+# other actions) so the serve layer can name it without importing torch; see
+# ``stages.build_reference_encode_admin_handler`` for the handler and
+# ``serve/openai_api.py`` for the HTTP route (POST /moss/encode_reference).
+ADMIN_ENCODE_REFERENCE = ADMIN_MOSS_ENCODE_REFERENCE
 
 # The codec runs at 12.5 frames/s and stages._MAX_REFERENCE_SECONDS caps an
 # audio reference at 100 s. Mirror that cap in frames so a code payload cannot
 # smuggle in a longer prefix than the audio path would have allowed (importing
 # the constant would be circular: stages imports this module's caller).
 _CODEC_FRAMES_PER_SECOND = 12.5
+CODEC_FRAMES_PER_SECOND = _CODEC_FRAMES_PER_SECOND
 _MAX_REFERENCE_SECONDS = 100.0
 MAX_REFERENCE_CODE_FRAMES = int(_MAX_REFERENCE_SECONDS * _CODEC_FRAMES_PER_SECOND)
 

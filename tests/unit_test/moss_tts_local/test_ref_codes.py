@@ -21,7 +21,11 @@ from sglang_omni.models.moss_tts_local.request_builders import (
     set_moss_tts_local_preprocessing_context,
 )
 from sglang_omni.pipeline.control_plane import serialize_message
-from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.proto import (
+    ADMIN_MOSS_ENCODE_REFERENCE,
+    OmniRequest,
+    StagePayload,
+)
 
 N_VQ = 12
 AUDIO_VOCAB_SIZE = 1024
@@ -269,3 +273,105 @@ def test_preprocess_rejects_malformed_codes():
             )
     finally:
         clear_moss_tts_local_preprocessing_context()
+
+
+# ----------------------------------------------------------------------
+#  Admin-plane reference encode (POST /moss/encode_reference)
+# ----------------------------------------------------------------------
+
+
+class _FakeReferenceEncoder:
+    """Stands in for the preprocessing stage's batched codec encoder."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def encode_data_uri(self, ref_audio: str) -> torch.Tensor:
+        self.seen.append(ref_audio)
+        if "boom" in ref_audio:
+            raise ValueError("not a data URI")
+        return _codes(3)
+
+
+def _handler(encoder):
+    from sglang_omni.models.moss_tts_local.stages import (
+        build_reference_encode_admin_handler,
+    )
+
+    return build_reference_encode_admin_handler(encoder, n_vq=N_VQ)
+
+
+def test_admin_encode_returns_wire_form_codes():
+    encoder = _FakeReferenceEncoder()
+    out = _handler(encoder)(
+        ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "data:audio/flac;base64,AAAA"}
+    )
+    assert out["success"] is True
+    assert out["n_vq"] == N_VQ
+    assert out["frames_per_second"] == 12.5
+    assert len(out["codes"]) == 1
+    # Round-trips through the very validator the generate path applies.
+    assert torch.equal(_decode(out["codes"][0]), _codes(3))
+    assert encoder.seen == ["data:audio/flac;base64,AAAA"]
+
+
+def test_admin_encode_preserves_request_order_for_batches():
+    encoder = _FakeReferenceEncoder()
+    items = [f"data:audio/flac;base64,{i}" for i in range(5)]
+    out = _handler(encoder)(ADMIN_MOSS_ENCODE_REFERENCE, {"audio": items})
+    assert out["success"] is True
+    assert len(out["codes"]) == 5
+    assert sorted(encoder.seen) == sorted(items)
+
+
+def test_admin_encode_result_is_msgpack_serializable():
+    """The codes cross a ZMQ control-plane hop; a tensor there would kill it."""
+    out = _handler(_FakeReferenceEncoder())(
+        ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "data:audio/wav;base64,AAAA"}
+    )
+    from sglang_omni.proto import AdminResult, AdminResultMessage
+
+    serialize_message(
+        AdminResultMessage(
+            AdminResult(
+                op_id="op",
+                stage="preprocessing",
+                action=ADMIN_MOSS_ENCODE_REFERENCE,
+                success=True,
+                data=out,
+            )
+        )
+    )
+
+
+@pytest.mark.parametrize("bad", [None, [], "", ["ok", 3]])
+def test_admin_encode_rejects_malformed_audio_field(bad):
+    out = _handler(_FakeReferenceEncoder())(
+        ADMIN_MOSS_ENCODE_REFERENCE, {"audio": bad}
+    )
+    assert out["success"] is False
+    assert "audio" in out["error"]
+
+
+def test_admin_encode_propagates_encoder_failure():
+    with pytest.raises(ValueError, match="not a data URI"):
+        _handler(_FakeReferenceEncoder())(
+            ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "boom"}
+        )
+
+
+def test_admin_handler_opts_out_of_foreign_actions():
+    """model_info/weight updates fan out to ALL stages; keep opting out."""
+    out = _handler(_FakeReferenceEncoder())("model_info", {})
+    assert out["success"] is True
+    assert out["unsupported"] is True and out["skipped"] is True
+
+
+def test_simple_scheduler_has_no_admin_attr_without_handler():
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    assert not hasattr(SimpleScheduler(lambda payload: payload), "admin")
+    assert hasattr(
+        SimpleScheduler(lambda payload: payload, admin_handler=lambda a, p: {}),
+        "admin",
+    )

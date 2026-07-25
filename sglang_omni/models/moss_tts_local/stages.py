@@ -28,6 +28,11 @@ from sglang_omni.models.moss_tts_local.audio_tokenizer import (
 from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
+from sglang_omni.models.moss_tts_local.ref_codes import (
+    ADMIN_ENCODE_REFERENCE,
+    CODEC_FRAMES_PER_SECOND,
+    encode_reference_codes,
+)
 from sglang_omni.models.moss_tts_local.request_builders import (
     cleanup_prepared_moss_tts_local_request,
     preprocess_moss_tts_local_payload,
@@ -481,6 +486,71 @@ class _MossLocalReferenceEncoder:
         return self._service.stats()
 
 
+def build_reference_encode_admin_handler(
+    reference_encoder: Any,
+    *,
+    n_vq: int,
+) -> Any:
+    """Admin-plane handler that turns audio into ``ref_codes`` wire payloads.
+
+    Why the admin plane and not a new data-plane stage: the codec that must run
+    lives in the preprocessing PROCESS (``set_moss_tts_local_preprocessing_context``
+    is a process-global), while uvicorn runs in the launcher process. The admin
+    control plane is the one existing channel that already crosses that
+    boundary with a request/response shape, targets a single stage by name, and
+    is executed off the stage's control loop via ``run_in_executor`` -- so an
+    encode neither blocks aborts/shutdown nor needs a second codec instance
+    (~1B params) resident in the HTTP process.
+
+    The encode goes through the SAME ``reference_encoder`` the request path
+    uses, so the returned codes are byte-identical to what an in-request
+    ``ref_audio`` encode would have produced (same 2-channel fold, resample,
+    loudness normalisation, chunk_duration=8 streaming encode) and share its
+    batching window and content-addressed cache.
+
+    Unknown actions reproduce the pre-existing "no admin support" answer of a
+    plain SimpleScheduler: ``/model_info`` and the weight-update actions fan out
+    to ALL stages, and this stage must keep opting out of them rather than
+    failing the aggregate.
+    """
+
+    def _encode_one(item: str) -> dict[str, Any]:
+        return encode_reference_codes(reference_encoder.encode_data_uri(item))
+
+    def handler(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if action != ADMIN_ENCODE_REFERENCE:
+            return {
+                "success": True,
+                "message": "stage does not support admin operations",
+                "skipped": True,
+                "unsupported": True,
+            }
+        raw = payload.get("audio")
+        items = [raw] if isinstance(raw, str) else list(raw or [])
+        if not items or not all(isinstance(x, str) and x for x in items):
+            return {
+                "success": False,
+                "error": (
+                    f"{ADMIN_ENCODE_REFERENCE}: 'audio' must be a non-empty data "
+                    "URI string or a list of them"
+                ),
+            }
+        # Submit concurrently so a multi-item call actually fills the reference
+        # encoder's batch window instead of paying one codec forward per item.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(items), 8)
+        ) as pool:
+            codes = list(pool.map(_encode_one, items))
+        return {
+            "success": True,
+            "codes": codes,
+            "n_vq": int(n_vq),
+            "frames_per_second": float(CODEC_FRAMES_PER_SECOND),
+        }
+
+    return handler
+
+
 def create_preprocessing_executor(
     model_path: str,
     *,
@@ -534,6 +604,9 @@ def create_preprocessing_executor(
         preprocess_moss_tts_local_payload,
         abort_callback=cleanup_prepared_moss_tts_local_request,
         max_concurrency=max_concurrency,
+        admin_handler=build_reference_encode_admin_handler(
+            reference_encoder, n_vq=int(processor.model_config.n_vq)
+        ),
     )
 
 

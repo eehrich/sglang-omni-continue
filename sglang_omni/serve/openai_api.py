@@ -66,7 +66,10 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
-from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+from sglang_omni.proto import (
+    ADMIN_MOSS_ENCODE_REFERENCE,
+    EXPLICIT_GENERATION_PARAMS_KEY,
+)
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
@@ -80,6 +83,8 @@ from sglang_omni.serve.protocol import (
     ContinueGenerationRequest,
     CreateSpeechBatchRequest,
     DestroyWeightsUpdateGroupRequest,
+    EncodeReferenceRequest,
+    EncodeReferenceResponse,
     GenerateAudio,
     GenerateFinishReason,
     GenerateMetaInfo,
@@ -266,6 +271,7 @@ def create_app(
     _register_chat_completions(app)
     _register_voices(app)
     _register_generate(app)
+    _register_reference_encode(app)
     _register_speech(app)
     _register_speech_batch(app)
     _register_speech_ws(app)
@@ -980,6 +986,60 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         output_modalities=output_modalities,
         metadata=metadata,
     )
+
+
+_REFERENCE_ENCODE_STAGE = "preprocessing"
+
+
+def _register_reference_encode(app: FastAPI) -> None:
+    """POST /moss/encode_reference — audio -> pre-computed ``ref_codes``.
+
+    A thin wrapper around the codec the MOSS-TTS Local preprocessing stage
+    already has resident: it hands back exactly the payload
+    ``metadata.tts_params.ref_codes`` accepts, so a client can encode a voice
+    (or a segment it will keep re-using as context) ONCE and then skip the
+    per-request codec encode -- the measured throughput ceiling for workloads
+    whose reference changes per request.
+
+    Not registered behind ``_auth``: this is a data-plane helper for the same
+    callers that may already POST /generate with the equivalent ref_audio, and
+    it neither reads nor mutates server state. 404 on a pipeline whose stage
+    graph has no ``preprocessing`` stage, and 501 when that stage has no
+    encoder -- both are the signal for a client to fall back to sending audio.
+    """
+
+    @app.post("/moss/encode_reference")
+    async def encode_reference(req: EncodeReferenceRequest) -> JSONResponse:
+        client: Client = app.state.client
+        audio = [req.audio] if isinstance(req.audio, str) else list(req.audio)
+        if not audio:
+            raise HTTPException(status_code=400, detail="'audio' must not be empty")
+        try:
+            result = await client.admin(
+                ADMIN_MOSS_ENCODE_REFERENCE,
+                {"audio": audio},
+                stages=[_REFERENCE_ENCODE_STAGE],
+                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+            )
+        except ValueError as exc:  # unknown stage: not a MOSS-TTS Local pipeline
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not result.get("success", False):
+            raise HTTPException(status_code=400, detail=result)
+        data: dict[str, Any] = {}
+        for item in result.get("results") or []:
+            data = dict(item.get("data") or {})
+            break
+        if data.get("unsupported") or "codes" not in data:
+            raise HTTPException(
+                status_code=501,
+                detail="this pipeline's preprocessing stage cannot encode references",
+            )
+        response = EncodeReferenceResponse(
+            codes=list(data.get("codes") or []),
+            n_vq=int(data.get("n_vq") or 0),
+            frames_per_second=float(data.get("frames_per_second") or 0.0),
+        )
+        return JSONResponse(content=response.model_dump())
 
 
 def _register_generate(app: FastAPI) -> None:

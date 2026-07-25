@@ -15,6 +15,11 @@ ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED = "update_weights_from_distributed"
 ADMIN_INIT_WEIGHTS_UPDATE_GROUP = "init_weights_update_group"
 ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP = "destroy_weights_update_group"
 ADMIN_WEIGHTS_CHECKER = "weights_checker"
+# MOSS-TTS Local: encode reference audio into pre-computed codec codes using
+# the codec the preprocessing stage already holds. Lives here (and not next to
+# the model) so the generic serve layer can name the action without importing
+# torch-backed model code.
+ADMIN_MOSS_ENCODE_REFERENCE = "moss_encode_reference"
 
 
 @dataclass
