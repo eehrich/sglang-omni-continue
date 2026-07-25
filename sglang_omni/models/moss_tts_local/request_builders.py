@@ -23,6 +23,10 @@ from sglang_omni.models.moss_tts.request_builders import (
     resolve_moss_reference,
 )
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.ref_codes import (
+    REF_CODES_PARAM,
+    decode_reference_codes,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.prepared_request_queue import PreparedRequestQueue
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -150,6 +154,43 @@ def build_moss_tts_local_state(payload: StagePayload) -> MossTTSLocalState:
     )
 
 
+def resolve_moss_tts_local_ref_codes(
+    payload: StagePayload,
+    *,
+    processor: Any,
+) -> torch.Tensor | None:
+    """Decode + validate pre-computed reference codes for one request.
+
+    Deliberately NOT a MossTTSLocalState field: the state dict is msgpack'd
+    on the terminal stage hop, so a tensor parked on it kills the vocoder
+    process, and echoing the packed form through every stage would ship the
+    reference twice. The codes are a preprocessing-local input -- they are
+    consumed while the prompt rows are built and never needed again.
+
+    Mirrors ``resolve_moss_reference`` on where it looks: a per-reference
+    descriptor wins over the flat ``tts_params`` field, and codes win over
+    ``ref_audio`` when both are present (they are the same reference, already
+    encoded).
+    """
+    inputs = payload.request.inputs or {}
+    metadata = payload.request.metadata or {}
+    tts_params = metadata.get("tts_params")
+    if not isinstance(tts_params, dict):
+        tts_params = {}
+    _, references = normalize_moss_tts_inputs(inputs)
+    reference = references[0] if references else {}
+    raw = reference.get(REF_CODES_PARAM) or tts_params.get(REF_CODES_PARAM)
+    if raw is None:
+        return None
+    cfg = processor.model_config
+    audio_vocab_size = int(
+        getattr(cfg, "audio_vocab_size", None) or getattr(cfg, "audio_pad_code", 1024)
+    )
+    return decode_reference_codes(
+        raw, n_vq=int(cfg.n_vq), audio_vocab_size=audio_vocab_size
+    )
+
+
 def build_generation_kwargs(
     params: dict[str, Any],
     *,
@@ -229,7 +270,18 @@ def _build_processor_message(
     processor: Any,
     state: MossTTSLocalState,
     reference_encoder: Any = None,
+    ref_codes: torch.Tensor | None = None,
 ) -> dict[str, Any]:
+    if ref_codes is not None:
+        # Pre-computed codes: hand the tensor straight to the processor, which
+        # takes [T, n_vq] verbatim. No codec encode runs for this request.
+        return processor.build_user_message(
+            text=state.text,
+            reference=[ref_codes],
+            instruction=state.instructions,
+            tokens=state.token_count,
+            language=state.language,
+        )
     ref_audio = state.ref_audio
     if reference_encoder is not None and isinstance(ref_audio, str):
         if _DATA_URI_RE.match(ref_audio) is None:
@@ -250,16 +302,21 @@ def _build_processor_message(
 
 def _encode_prior_audio_codes(
     processor: Any,
-    ref_audio: Any,
+    state: MossTTSLocalState,
     reference_encoder: Any = None,
+    ref_codes: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Encode prior-segment audio into codec codes for a continuation turn.
+    """Resolve the prior-segment codes for a continuation turn.
 
-    Reuses the SAME reference channel (path or data URI) the voice-clone
-    path uses -- continuation needs no new transport. The batched reference
-    encoder runs the (chunked) codec encode; without it we fall back to the
-    processor's own path/data-URI encoder.
+    Reuses the SAME reference channel (codes, path or data URI) the
+    voice-clone path uses -- continuation needs no new transport. Pre-computed
+    codes short-circuit the codec entirely; otherwise the batched reference
+    encoder runs the (chunked) encode, falling back to the processor's own
+    path/data-URI encoder.
     """
+    if ref_codes is not None:
+        return ref_codes
+    ref_audio = state.ref_audio
     if reference_encoder is not None and isinstance(ref_audio, str):
         if _DATA_URI_RE.match(ref_audio) is None:
             return reference_encoder.encode(ref_audio)
@@ -276,6 +333,7 @@ def _build_continuation_conversation(
     processor: Any,
     state: MossTTSLocalState,
     reference_encoder: Any = None,
+    ref_codes: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     """Build a [user(full text), assistant(prior audio)] continuation turn.
 
@@ -287,7 +345,7 @@ def _build_continuation_conversation(
     duration hint, mirroring the reference MOSSVoiceContinue node.
     """
     prior_codes = _encode_prior_audio_codes(
-        processor, state.ref_audio, reference_encoder
+        processor, state, reference_encoder, ref_codes
     )
     user_message = processor.build_user_message(
         text=state.text,
@@ -309,6 +367,7 @@ def _prepare_moss_tts_local_request(
     reference_encoder: Any = None,
 ) -> MossTTSLocalPreparedRequest:
     state = build_moss_tts_local_state(payload)
+    ref_codes = resolve_moss_tts_local_ref_codes(payload, processor=processor)
     metadata = (
         payload.request.metadata
         if isinstance(payload.request.metadata, dict)
@@ -320,13 +379,15 @@ def _prepare_moss_tts_local_request(
         if isinstance(tts_params, dict)
         else False
     )
-    if continuation and state.ref_audio is not None:
+    if continuation and (ref_codes is not None or state.ref_audio is not None):
         conversation = _build_continuation_conversation(
-            processor, state, reference_encoder
+            processor, state, reference_encoder, ref_codes
         )
         batch = processor([conversation], mode="continuation")
     else:
-        message = _build_processor_message(processor, state, reference_encoder)
+        message = _build_processor_message(
+            processor, state, reference_encoder, ref_codes
+        )
         batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:

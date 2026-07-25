@@ -320,6 +320,9 @@ class SpeechReference(BaseModel):
     media_type: str | None = None
     text: str | None = None
     vq_codes: list[list[int]] | list[int] | None = None
+    # MOSS-TTS Local: pre-computed codec codes for this reference, packed as
+    # {"data": <base64 int16>, "shape": [T, n_vq]} or a nested int list.
+    ref_codes: dict[str, Any] | list[Any] | None = None
 
 
 class CreateSpeechRequest(BaseModel):
@@ -349,6 +352,10 @@ class CreateSpeechRequest(BaseModel):
 
     # Voice cloning parameters
     ref_audio: str | None = None  # path or URL to reference audio
+    # Pre-computed reference codec codes, skipping the server-side encode:
+    # {"data": <base64 int16>, "shape": [T, n_vq], "dtype": "int16"} or a
+    # nested int list. Wins over ref_audio when both are present.
+    ref_codes: dict[str, Any] | list[Any] | None = None
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
     x_vector_only_mode: bool | None = None
@@ -386,6 +393,7 @@ class SpeechBatchItem(BaseModel):
     language: Any = None
     instructions: Any = None
     ref_audio: Any = None
+    ref_codes: Any = None
     ref_text: Any = None
     references: Any = None
     x_vector_only_mode: Any = None

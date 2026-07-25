@@ -52,10 +52,18 @@ class _FakeAudioTokenizerModel:
     def __init__(self) -> None:
         self.config = types.SimpleNamespace(sampling_rate=48000, number_channels=2)
         self.calls: list[tuple[list[torch.Tensor], int]] = []
+        self.chunk_durations: list[float | None] = []
 
-    def batch_encode(self, wavs: list[torch.Tensor], *, num_quantizers: int):
+    def batch_encode(
+        self,
+        wavs: list[torch.Tensor],
+        *,
+        num_quantizers: int,
+        chunk_duration: float | None = None,
+    ):
         assert all(wav.ndim == 2 and wav.shape[0] == 2 for wav in wavs)
         self.calls.append((wavs, int(num_quantizers)))
+        self.chunk_durations.append(chunk_duration)
         max_len = max(int(wav.shape[-1]) for wav in wavs)
         audio_codes = torch.zeros(num_quantizers, len(wavs), max_len, dtype=torch.long)
         audio_codes_lengths = torch.tensor(
