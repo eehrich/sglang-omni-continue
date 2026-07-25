@@ -248,6 +248,60 @@ def _build_processor_message(
     )
 
 
+def _encode_prior_audio_codes(
+    processor: Any,
+    ref_audio: Any,
+    reference_encoder: Any = None,
+) -> torch.Tensor:
+    """Encode prior-segment audio into codec codes for a continuation turn.
+
+    Reuses the SAME reference channel (path or data URI) the voice-clone
+    path uses -- continuation needs no new transport. The batched reference
+    encoder runs the (chunked) codec encode; without it we fall back to the
+    processor's own path/data-URI encoder.
+    """
+    if reference_encoder is not None and isinstance(ref_audio, str):
+        if _DATA_URI_RE.match(ref_audio) is None:
+            return reference_encoder.encode(ref_audio)
+        return reference_encoder.encode_data_uri(ref_audio)
+    reference = _reference_for_processor(processor, ref_audio)
+    if not reference:
+        raise ValueError(
+            "MOSS-TTS Local continuation requires a resolvable prior audio"
+        )
+    return reference[0]
+
+
+def _build_continuation_conversation(
+    processor: Any,
+    state: MossTTSLocalState,
+    reference_encoder: Any = None,
+) -> list[dict[str, Any]]:
+    """Build a [user(full text), assistant(prior audio)] continuation turn.
+
+    The prior segment's codes go into the assistant slot with NO audio_end
+    (the processor's continuation builder truncates it), so the model
+    resumes its own token stream -- exact voice carry-over rather than a
+    fresh clone. ``state.text`` already carries the full concatenated text
+    (previous + new) and ``state.token_count`` the TOTAL (prefix + new)
+    duration hint, mirroring the reference MOSSVoiceContinue node.
+    """
+    prior_codes = _encode_prior_audio_codes(
+        processor, state.ref_audio, reference_encoder
+    )
+    user_message = processor.build_user_message(
+        text=state.text,
+        reference=None,
+        instruction=state.instructions,
+        tokens=state.token_count,
+        language=state.language,
+    )
+    assistant_message = processor.build_assistant_message(
+        audio_codes_list=[prior_codes]
+    )
+    return [user_message, assistant_message]
+
+
 def _prepare_moss_tts_local_request(
     payload: StagePayload,
     *,
@@ -255,8 +309,25 @@ def _prepare_moss_tts_local_request(
     reference_encoder: Any = None,
 ) -> MossTTSLocalPreparedRequest:
     state = build_moss_tts_local_state(payload)
-    message = _build_processor_message(processor, state, reference_encoder)
-    batch = processor([[message]], mode="generation")
+    metadata = (
+        payload.request.metadata
+        if isinstance(payload.request.metadata, dict)
+        else {}
+    )
+    tts_params = metadata.get("tts_params")
+    continuation = (
+        bool(tts_params.get("continuation"))
+        if isinstance(tts_params, dict)
+        else False
+    )
+    if continuation and state.ref_audio is not None:
+        conversation = _build_continuation_conversation(
+            processor, state, reference_encoder
+        )
+        batch = processor([conversation], mode="continuation")
+    else:
+        message = _build_processor_message(processor, state, reference_encoder)
+        batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
         raise ValueError(
