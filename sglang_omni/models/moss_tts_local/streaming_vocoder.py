@@ -17,8 +17,13 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.ref_codes import encode_reference_codes
 from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
-from sglang_omni.proto import StagePayload
+from sglang_omni.proto import (
+    MOSS_GENERATED_CODES_FIELD,
+    MOSS_RETURN_CODES_PARAM,
+    StagePayload,
+)
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
@@ -752,6 +757,52 @@ class MossTTSLocalStreamingVocoderScheduler(
             return state, None
         return state, codes
 
+    @staticmethod
+    def _return_codes_requested(payload: StagePayload) -> bool:
+        """Did this request opt in to getting its generated codes back?
+
+        Opt-in (``metadata.tts_params.return_codes``) rather than always-on: the
+        packed codes are ~2 KB per generated second, which every existing caller
+        would pay for on a response it never reads.
+        """
+        request = getattr(payload, "request", None)
+        metadata = getattr(request, "metadata", None)
+        if not isinstance(metadata, dict):
+            return False
+        tts_params = metadata.get("tts_params")
+        if not isinstance(tts_params, dict):
+            return False
+        return bool(tts_params.get(MOSS_RETURN_CODES_PARAM))
+
+    def _attach_generated_codes(
+        self, payload: StagePayload, codes: torch.Tensor
+    ) -> None:
+        """Echo the just-generated codes back in the ``ref_codes`` wire form.
+
+        These are the exact ``[T, n_vq]`` rows the AR engine produced and this
+        vocoder is about to turn into audio, so a caller chaining segments can
+        feed them into the next request's conditioning window verbatim instead
+        of shipping the vocoded WAV back for a second codec encode. That encode
+        runs in the preprocessing stage on the codec GPU, next to this vocoder:
+        measured 30.6 ``/moss/encode_reference`` calls per minute at ~20
+        segments/min, 19-54% of the card on top of the vocoder's 64-70%. Handing
+        the codes back removes it outright.
+
+        Packing (not the raw tensor) matters twice: the terminal payload is
+        msgpack'd on the stage hop, where a tensor would kill the process, and
+        the packed dict is byte-identical to what ``ref_codes`` accepts.
+        """
+        try:
+            rows = codes[:, : self._n_vq].detach().to("cpu", torch.long).contiguous()
+            payload.data[MOSS_GENERATED_CODES_FIELD] = encode_reference_codes(rows)
+        except Exception:
+            # Never fail a finished request over the echo: the caller's
+            # documented fallback is to encode the audio itself.
+            logger.exception(
+                "MOSS-TTS Local: could not pack generated codes for %s",
+                payload.request_id,
+            )
+
     def _store_vocoder_result(
         self,
         payload: StagePayload,
@@ -762,12 +813,21 @@ class MossTTSLocalStreamingVocoderScheduler(
         audio_payload = audio_waveform_payload(
             wav, source_hint=_SOURCE_HINT, keep_channels=True
         )
+        # Read before the clear below: this is the last point the generated
+        # codes exist on the request.
+        generated_codes = (
+            state.audio_codes if self._return_codes_requested(payload) else None
+        )
         state.audio_codes = None
         state.sample_rate = self._sample_rate
         payload.data = state.to_dict()
         payload.data.update(audio_payload)
         payload.data["sample_rate"] = state.sample_rate
         payload.data["modality"] = "audio"
+        if generated_codes is not None:
+            self._attach_generated_codes(
+                payload, torch.as_tensor(generated_codes, dtype=torch.long)
+            )
         usage = build_usage(state)
         if usage is not None:
             payload.data["usage"] = usage

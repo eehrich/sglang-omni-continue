@@ -142,6 +142,9 @@ class GenerateChunk:
     modality: str = "text"
     audio_data: Any = None
     sample_rate: int | None = None
+    # MOSS-TTS Local: packed codes the AR engine generated, present only when
+    # the request set metadata.tts_params.return_codes (see proto/request.py).
+    generated_codes: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -160,6 +163,7 @@ class GenerateChunk:
             "modality": self.modality,
             "audio_data": self.audio_data,
             "sample_rate": self.sample_rate,
+            "generated_codes": self.generated_codes,
         }
 
 
@@ -205,6 +209,8 @@ class CompletionResult:
     output_token_logprobs: list[Any] | None = None
     omni_rollout: dict[str, Any] | None = None
     weight_version: str | None = None
+    # MOSS-TTS Local: packed codes for the generated audio, opt-in per request.
+    generated_codes: dict[str, Any] | None = None
 
 
 @dataclass

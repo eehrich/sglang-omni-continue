@@ -1084,7 +1084,12 @@ def _register_generate(app: FastAPI) -> None:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         response = _build_generate_response(req, result, audio_format)
-        return JSONResponse(content=response.model_dump())
+        content = response.model_dump()
+        if content.get("codes") is None:
+            # Opt-in field: drop it entirely rather than adding a null key, so a
+            # caller that did not ask for codes sees a byte-identical response.
+            content.pop("codes", None)
+        return JSONResponse(content=content)
 
 
 def _rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
@@ -1224,7 +1229,12 @@ def _build_generate_response(
         ),
         omni_rollout=result.omni_rollout if req.return_omni_rollout else None,
     )
-    return GenerateResponse(text=result.text, audio=audio, meta_info=meta_info)
+    return GenerateResponse(
+        text=result.text,
+        audio=audio,
+        codes=result.generated_codes,
+        meta_info=meta_info,
+    )
 
 
 def _register_realtime(app: FastAPI) -> None:

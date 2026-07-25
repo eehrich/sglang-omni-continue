@@ -285,6 +285,13 @@ class GenerateResponse(BaseModel):
 
     text: str = ""
     audio: GenerateAudio | None = None
+    # MOSS-TTS Local: the codes behind ``audio``, in the exact wire form
+    # ``tts_params.ref_codes`` accepts, so a caller chaining segments can
+    # condition the next request on this one without a round trip through
+    # /moss/encode_reference. Present only when the request asked for it
+    # (``metadata.tts_params.return_codes``); None keeps every existing
+    # response byte-identical.
+    codes: dict[str, Any] | None = None
     meta_info: GenerateMetaInfo
 
 

@@ -30,6 +30,23 @@ class RequestInfo:
 
 EXPLICIT_GENERATION_PARAMS_KEY = "explicit_generation_params"
 
+# MOSS-TTS Local: opt-in echo of the codes the AR engine just generated.
+#
+# ``metadata.tts_params.return_codes`` (bool) asks the vocoder stage to park the
+# generated ``[T, n_vq]`` codes on the terminal payload under
+# ``MOSS_GENERATED_CODES_FIELD``, packed in the SAME wire form the ``ref_codes``
+# INPUT accepts (base64 int16, C-contiguous row-major, plus shape+dtype). A
+# caller that chains segments -- each one conditioned on a window of the
+# previous ones -- can then feed the value straight back in instead of paying a
+# second codec encode on audio it already had the codes for.
+#
+# The names live here, next to StagePayload, so the generic serve/client layer
+# can read the field without importing torch-backed model code (same reason as
+# ADMIN_MOSS_ENCODE_REFERENCE in proto/admin.py). The packing itself is in
+# models/moss_tts_local/ref_codes.py, which owns the format.
+MOSS_RETURN_CODES_PARAM = "return_codes"
+MOSS_GENERATED_CODES_FIELD = "generated_codes"
+
 
 @dataclass
 class OmniRequest:

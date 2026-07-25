@@ -30,6 +30,8 @@ from .messages import (
 )
 from .request import (
     EXPLICIT_GENERATION_PARAMS_KEY,
+    MOSS_GENERATED_CODES_FIELD,
+    MOSS_RETURN_CODES_PARAM,
     OmniRequest,
     RequestInfo,
     RequestState,
@@ -66,6 +68,8 @@ __all__ = [
     "RequestState",
     "RequestInfo",
     "EXPLICIT_GENERATION_PARAMS_KEY",
+    "MOSS_GENERATED_CODES_FIELD",
+    "MOSS_RETURN_CODES_PARAM",
     "OmniRequest",
     "StagePayload",
     "StageInfo",

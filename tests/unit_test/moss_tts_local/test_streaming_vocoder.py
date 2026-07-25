@@ -25,6 +25,7 @@ from torch import nn
 
 from sglang_omni.models.moss_tts_local import stages
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.ref_codes import decode_reference_codes
 from sglang_omni.models.moss_tts_local.request_builders import (
     build_moss_tts_local_stream_metadata,
 )
@@ -33,11 +34,17 @@ from sglang_omni.models.moss_tts_local.streaming_vocoder import (
     _CodecStreamSession,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
-from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.proto import (
+    MOSS_GENERATED_CODES_FIELD,
+    MOSS_RETURN_CODES_PARAM,
+    OmniRequest,
+    StagePayload,
+)
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
 N_VQ = 4
+AUDIO_VOCAB_SIZE = 1024
 SAMPLES_PER_FRAME = 4
 SAMPLE_RATE = 48000
 
@@ -266,7 +273,12 @@ def _terminal_payload(
     )
 
 
-def _offline_payload(rows: torch.Tensor, request_id: str) -> StagePayload:
+def _offline_payload(
+    rows: torch.Tensor,
+    request_id: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> StagePayload:
     state = MossTTSLocalState(
         text="x",
         audio_codes=rows[:, 1:].clone(),
@@ -276,7 +288,7 @@ def _offline_payload(rows: torch.Tensor, request_id: str) -> StagePayload:
     )
     return StagePayload(
         request_id=request_id,
-        request=OmniRequest(inputs="", params={}),
+        request=OmniRequest(inputs="", params={}, metadata=metadata or {}),
         data=state.to_dict(),
     )
 
@@ -1001,6 +1013,49 @@ def test_non_streaming_path_ignores_idle_startup_session(monkeypatch) -> None:
     np.testing.assert_array_equal(
         _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
     )
+
+
+def test_generated_codes_are_not_returned_by_default(monkeypatch) -> None:
+    """No flag, no payload growth: the response shape is unchanged."""
+    scheduler = _make_scheduler(monkeypatch, FakeProcessor())
+    rows = _rows(9, seed=11)
+
+    (result,) = scheduler._vocode_batch([_offline_payload(rows, "no-flag")])
+
+    assert MOSS_GENERATED_CODES_FIELD not in result.data
+
+
+def test_generated_codes_echo_in_ref_codes_wire_form(monkeypatch) -> None:
+    """The echoed codes ARE the generated codes, in the form ref_codes accepts.
+
+    This is the whole point of the flag: the value must be feedable straight
+    back into ``tts_params.ref_codes`` with no conversion, so the next segment
+    can condition on this one without a second codec encode.
+    """
+    scheduler = _make_scheduler(monkeypatch, FakeProcessor())
+    rows = _rows(9, seed=11)
+    payload = _offline_payload(
+        rows,
+        "with-flag",
+        metadata={"tts_params": {MOSS_RETURN_CODES_PARAM: True}},
+    )
+
+    (result,) = scheduler._vocode_batch([payload])
+
+    packed = result.data[MOSS_GENERATED_CODES_FIELD]
+    assert packed["dtype"] == "int16"
+    assert packed["shape"] == [int(rows.shape[0]), N_VQ]
+    # Round-trips through the INPUT decoder byte-exactly.
+    decoded = decode_reference_codes(
+        packed, n_vq=N_VQ, audio_vocab_size=AUDIO_VOCAB_SIZE
+    )
+    torch.testing.assert_close(decoded, rows[:, 1:].to(torch.long))
+    # The audio is still the audio: the echo does not disturb the vocode.
+    np.testing.assert_array_equal(
+        _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
+    )
+    # audio_codes itself is still cleared (msgpack safety on the stage hop).
+    assert result.data.get("audio_codes") is None
 
 
 def test_non_streaming_empty_audio_codes_skip_decode(monkeypatch) -> None:

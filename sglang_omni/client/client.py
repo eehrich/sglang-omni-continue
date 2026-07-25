@@ -30,7 +30,12 @@ from sglang_omni.client.types import (
     UsageInfo,
 )
 from sglang_omni.pipeline.coordinator import Coordinator
-from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
+from sglang_omni.proto import (
+    MOSS_GENERATED_CODES_FIELD,
+    OmniRequest,
+    RequestState,
+    StreamMessage,
+)
 
 
 class Client:
@@ -96,6 +101,7 @@ class Client:
         saw_output_token_logprobs = False
         omni_rollout: dict[str, Any] | None = None
         weight_version: str | None = None
+        generated_codes: dict[str, Any] | None = None
 
         async for chunk in self.generate(request, request_id=request_id):
             last_chunk = chunk
@@ -114,6 +120,8 @@ class Client:
                 omni_rollout = chunk.omni_rollout
             if chunk.weight_version is not None:
                 weight_version = chunk.weight_version
+            if chunk.generated_codes is not None:
+                generated_codes = chunk.generated_codes
 
         if last_chunk is None:
             raise ClientError("No response from pipeline")
@@ -150,6 +158,7 @@ class Client:
             ),
             omni_rollout=omni_rollout,
             weight_version=weight_version,
+            generated_codes=generated_codes,
         )
 
     # ------------------------------------------------------------------
@@ -482,6 +491,7 @@ class Client:
                 if weight_version is not None:
                     chunk.weight_version = weight_version
                 Client._set_audio_data(chunk, audio_result)
+                chunk.generated_codes = audio_result.get(MOSS_GENERATED_CODES_FIELD)
                 chunk.usage = Client._build_usage_info(
                     decode_result
                 ) or Client._build_usage_info(audio_result)
@@ -515,6 +525,7 @@ class Client:
             if modality is not None:
                 chunk.modality = modality
             Client._set_audio_data(chunk, result)
+            chunk.generated_codes = result.get(MOSS_GENERATED_CODES_FIELD)
             chunk.usage = Client._build_usage_info(result)
             return chunk
         if isinstance(result, str):
