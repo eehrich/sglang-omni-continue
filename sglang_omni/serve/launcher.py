@@ -60,14 +60,36 @@ logger = logging.getLogger(__name__)
 
 
 def _find_available_port(host: str, port: int) -> int:
-    """Return *port* if available, otherwise find a free port and warn."""
+    """Return *port*, or fail — do NOT silently serve somewhere else.
+
+    Drifting to a random port is worse than not starting: systemd reports the
+    unit active, the process looks healthy on its own probe, and every client
+    plus any port-based watchdog sees a dead service. A watchdog wired to the
+    configured port will then restart the machine in a loop while the server is
+    happily running on a port nobody knows.
+
+    The probe also sets SO_REUSEADDR, which is what uvicorn does when it binds
+    for real. Without it a socket left in TIME_WAIT by a killed predecessor
+    reads as "in use" although the server would bind it fine — the fallback
+    then triggered for a port that was never actually taken.
+
+    Set SGLANG_OMNI_PORT_FALLBACK=1 to restore the old pick-any-port behaviour.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, port))
             return port
-    except OSError:
-        pass
-    logger.warning(f"Port {port} is already in use on {host}.")
+    except OSError as exc:
+        fallback = os.environ.get("SGLANG_OMNI_PORT_FALLBACK", "").strip().lower()
+        if fallback not in {"1", "true", "yes", "on"}:
+            raise RuntimeError(
+                f"Cannot bind the requested port {port} on {host}: {exc}. "
+                f"Refusing to serve on a different port — clients and watchdogs "
+                f"address {port}. Free it (or set SGLANG_OMNI_PORT_FALLBACK=1 to "
+                f"allow an arbitrary port)."
+            ) from exc
+        logger.warning(f"Port {port} is already in use on {host}.")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         free_port = s.getsockname()[1]
