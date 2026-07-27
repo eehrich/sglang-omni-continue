@@ -753,7 +753,21 @@ def apply_sglang_moss_tts_result(
         else:
             start, end = bounds
             payload_rows = rows[start:end]
-            state.assistant_start_length = 0
+            # How many of these rows came from the PROMPT rather than from
+            # generation. Zeroing it instead (as this did) loses the only
+            # marker for where the new audio begins: on a continuation the
+            # prefix is prior audio, so the vocoder rendered it again and the
+            # echoed codes carried it. A caller chaining segments then
+            # re-appends the whole prefix every step and walks into the
+            # reference length limit within a handful of segments.
+            #
+            # On the clone path these rows are the assistant header between
+            # the generation slot and the first emitted frame, so trimming
+            # them is right there too -- it mirrors what the reference
+            # extractor does with ``start_length``.
+            state.assistant_start_length = max(
+                0, int(assistant_prefix_rows.shape[0]) - int(start)
+            )
         state.delayed_audio_codes = payload_rows[:, 1:].detach().cpu()
     else:
         n_vq = (
