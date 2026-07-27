@@ -1,5 +1,11 @@
 # MOSS-TTS Delay (8B): windowed references raise the pitch on sglang-omni
 
+> **Resolved.** The cause was the grouping of the audio repetition penalty:
+> sglang applied it per codebook, the reference implementation applies one
+> shared token set across codebooks 1..n-1. See "The cause" at the end; the
+> investigation is kept because most of it is negative results that are worth
+> not repeating.
+
 Serving MOSS-TTS-v1.5 (Delay, `n_vq` 32) through sglang-omni and conditioning
 each segment on a re-anchored sliding window — base voice plus the previously
 generated segment, the shape long-form narration uses — raises the fundamental
@@ -136,6 +142,43 @@ Four seconds still carries the prosodic context the window exists for and
 lands within the spread of the clone control, so it is a usable setting until
 the engine side is fixed. Ten seconds is not enough of a cap: in a chain the
 residue still compounds.
+
+## The cause
+
+Per-codebook statistics over two predecessors generated from the same base,
+text and seed showed sglang's codes carrying about **0.34 bits more entropy in
+every one of the 32 codebooks** — uniformly, channel 0 least. Same nominal
+temperature, top-p and top-k, so something was flattening the distribution
+less than the reference does.
+
+It is the audio repetition penalty. `generate()` hands
+`apply_repetition_penalty_delay_pattern` logits of shape `[N, V]` for the
+audio heads, because the mask indexing in the loop flattens batch and codebook
+together — so its delay-pattern branch never runs and the 2-D branch takes
+`prev_tokens.reshape(-1)`. Codebook 0 is penalised against its own history,
+while codebooks 1..n-1 share **one** token set: the union of their histories,
+applied identically to each. sglang grouped it per codebook, which is the
+natural reading of the function's name but not what the caller reaches.
+
+Penalising a union instead of a column pushes far more of the vocabulary down,
+and since most logits sit below the maximum that sharpens the distribution.
+The gap grows with reference length, because a longer window widens the union
+— which is exactly why single clones were fine and a re-anchored window was
+not.
+
+With the grouping matched (`model_runner._apply_audio_repetition_penalty`):
+
+| | before | after |
+|---|---|---|
+| 39 s window, generated content | 120.3 Hz | **103.9** |
+| 39 s window, real content | 94.7 | 100.6 |
+| six-step chain | 115.5 | **99.0** |
+| six-step clone control | 94.2 | 96.7 |
+
+The asymmetry between generated and real content in the window — 25 Hz before,
+3 Hz after — is the part that matters: those two should behave alike, and now
+they do. Chain against clone falls from +3.5 semitones to +0.4, against 0 for
+the HF reference, which is inside the per-take spread of these measurements.
 
 ## Why it matters
 

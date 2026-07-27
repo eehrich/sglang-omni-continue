@@ -651,15 +651,43 @@ class MossTTSModelRunner(ModelRunner):
         *,
         n_vq: int,
     ) -> None:
-        """In-place delay-pattern repetition penalty, per request and codebook.
+        """In-place repetition penalty over the same token sets the model uses.
 
         Each request's own ``audio_repetition_penalty`` is applied (requests with
         a unit penalty are skipped). Only invoked when at least one request has a
         non-unit penalty (off by default), so this per-request loop is off the
         hot path.
+
+        The grouping is not per codebook, which is the natural reading of
+        ``apply_repetition_penalty_delay_pattern`` but not what the reference
+        implementation reaches. It hands that function ``[N, V]`` logits for the
+        audio heads -- the mask indexing in ``generate`` flattens batch and
+        codebook together -- so the delay-pattern branch never runs and the
+        2-D branch takes ``prev_tokens.reshape(-1)`` instead. Codebook 0 is
+        penalised against its own history (``generation_ids[:, :, 1]``), while
+        codebooks 1..n-1 share ONE token set: the union of their histories
+        (``generation_ids[:, :, 2:]``), applied identically to each.
+
+        The difference is not cosmetic. Penalising a union rather than a column
+        pushes far more of the vocabulary down, and since most logits sit below
+        the maximum that sharpens the distribution. Measured on MOSS-TTS-v1.5,
+        per-codebook grouping left every codebook about 0.34 bits hotter than
+        the reference, and the gap grows with the reference length because a
+        longer window widens the union -- which is what made a re-anchored
+        window drift upward in pitch while single clones stayed put.
         """
         device = audio_logits.device
         vocab = audio_logits.shape[-1]
+
+        def _penalise(rows: torch.Tensor, tokens: torch.Tensor, penalty: float) -> None:
+            tokens = tokens[(tokens >= 0) & (tokens < vocab)]
+            if tokens.numel() == 0:
+                return
+            scores = rows[..., tokens]
+            rows[..., tokens] = torch.where(
+                scores > 0, scores / penalty, scores * penalty
+            )
+
         for i, data in enumerate(datas):
             penalty = float(data.audio_repetition_penalty)
             if penalty == 1.0:
@@ -676,14 +704,10 @@ class MossTTSModelRunner(ModelRunner):
             history = torch.cat(
                 [part.to(device=device, dtype=torch.long) for part in parts], dim=0
             )
-            for channel in range(n_vq):
-                tokens = torch.unique(history[:, channel])
-                tokens = tokens[(tokens >= 0) & (tokens < vocab)]
-                if tokens.numel() == 0:
-                    continue
-                scores = audio_logits[i, channel, tokens]
-                audio_logits[i, channel, tokens] = torch.where(
-                    scores > 0, scores / penalty, scores * penalty
+            _penalise(audio_logits[i, 0], torch.unique(history[:, 0]), penalty)
+            if n_vq > 1:
+                _penalise(
+                    audio_logits[i, 1:], torch.unique(history[:, 1:]), penalty
                 )
 
     def post_process_outputs(
