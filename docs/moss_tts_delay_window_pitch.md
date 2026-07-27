@@ -81,6 +81,16 @@ than about a semitone.
   99.7), so the plain `[T, n_vq]` rows are the right form.
 - **Trimming the head** of the predecessor (its delay ramp-in region): 111.1
   without the first 32 frames, 108.8 without the first 64 — still elevated.
+- **The delay stagger of the fed-back codes.** A deterministic decode (top_k
+  1) shows the two engines emit the same channel-0 stream but in different
+  shapes: HF returns `[T + n_vq - 1, n_vq]` rows where channel `c` is shifted
+  by `c` frames and the inactive channels hold `audio_pad`, while this port
+  reverses that to the plain `[T, n_vq]` an encoder produces — the 144 vs 113
+  frame counts differ by exactly `n_vq - 1`. Feeding the stagger back
+  verbatim (pad preserved, validator opened to accept it) changes nothing:
+  117.6 Hz staggered vs 115.1 plain, control 99.7. An earlier version of this
+  test clipped the codes to `[0, 1023]` and so destroyed the pad markers; its
+  result was meaningless.
 - **`audio_length` seeded from the prompt.** `_initialize_generation_state`
   treats a clone prompt as a continuation (it also ends on the assistant gen
   slot), so `audio_length` starts at the reference length and
@@ -92,12 +102,22 @@ than about a semitone.
 
 Something in the Delay engine's own emission differs from
 `model.generate()`'s in a way that is inaudible in the segment itself but
-that a later clone reads as part of the voice. The audio is fine; the codes
-carry it. Candidates not yet excluded: the delay bookkeeping in
+that a later clone reads as part of the voice.
+
+It survives a full audio round trip: re-encoding the generated WAV through
+the codec, so that the window carries ordinary encoder codes rather than the
+echo, still leaves the pitch at 110.7 Hz against 94.7 for real speech. So it
+is carried by the waveform, not by the code representation — which also rules
+the wire format out on its own terms.
+
+Candidates not yet excluded: the delay bookkeeping in
 `model_runner._sample_rows` (`pre_audio` / `post_audio` masks, the
-`delayed`/`audio_lengths` update), and the channel-splitting heuristic in
+`delayed`/`audio_lengths` update), the channel-splitting heuristic in
 `sglang_model._prepare_multi_modal_inputs`, which infers the layout from
-`total_tokens % channels`.
+`total_tokens % channels`, and the vocoder stage's own reversal
+(`split_moss_audio_segments`) against the processor's `_parse_audio_codes` —
+the two agree with each other (correlation 1.000) but have not been checked
+against HF's parse of the same rows.
 
 ## A mitigation that works today
 
