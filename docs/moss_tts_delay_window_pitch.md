@@ -99,6 +99,24 @@ carry it. Candidates not yet excluded: the delay bookkeeping in
 `sglang_model._prepare_multi_modal_inputs`, which infers the layout from
 `total_tokens % channels`.
 
+## A mitigation that works today
+
+The rise scales with how much generated audio the window carries, so capping
+the predecessor to a short tail buys most of it back. Six-step chains, three
+seeds, same base anchor, only the predecessor portion trimmed:
+
+| predecessor kept in the window | chain median F0 |
+|---|---|
+| all of it (20–26 s) | 115.5 |
+| last 10 s | 104.6 |
+| **last 4 s** | **100.0** |
+| none (clone control) | 93.3 |
+
+Four seconds still carries the prosodic context the window exists for and
+lands within the spread of the clone control, so it is a usable setting until
+the engine side is fixed. Ten seconds is not enough of a cap: in a chain the
+residue still compounds.
+
 ## Why it matters
 
 For single-shot cloning the Delay model on sglang-omni is fine — this only
