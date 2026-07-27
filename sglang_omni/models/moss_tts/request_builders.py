@@ -470,6 +470,57 @@ def _build_processor_message(
     )
 
 
+def _prior_audio_codes(
+    processor: Any,
+    state: MossTTSState,
+    ref_codes: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Resolve the prior-segment codes for a continuation turn.
+
+    Reuses the SAME reference channel the clone path uses -- codes, a path or
+    a data URI -- so continuation needs no new transport. Pre-computed codes
+    skip the codec entirely.
+    """
+    if ref_codes is not None:
+        return ref_codes
+    reference = _reference_for_processor(processor, state.ref_audio)
+    if not reference:
+        raise ValueError("MOSS-TTS continuation requires a resolvable prior audio")
+    return torch.as_tensor(reference[0], dtype=torch.long)
+
+
+def _build_continuation_conversation(
+    processor: Any,
+    state: MossTTSState,
+    ref_codes: torch.Tensor | None = None,
+) -> list[dict[str, Any]]:
+    """Build a [user(full text), assistant(prior audio)] continuation turn.
+
+    The prior audio goes into the ASSISTANT slot so the model resumes its own
+    token stream instead of cloning from a reference. ``state.text`` already
+    carries the concatenated previous+new text and ``state.token_count`` the
+    TOTAL (prefix + new) duration hint, mirroring the MOSSVoiceContinue node
+    the ComfyUI path drives -- the reference implementation for this mode.
+
+    The user turn carries NO reference: the voice comes from the prefix. What
+    the caller puts in that prefix decides the mode -- the last segment alone
+    for ``sliding_window``, the base recording concatenated in front of it for
+    ``sliding_window_ref_anchor``.
+    """
+    prior_codes = _prior_audio_codes(processor, state, ref_codes)
+    user_message = processor.build_user_message(
+        text=state.text,
+        reference=None,
+        instruction=state.instructions,
+        tokens=state.token_count,
+        language=state.language,
+    )
+    assistant_message = processor.build_assistant_message(
+        audio_codes_list=[prior_codes]
+    )
+    return [user_message, assistant_message]
+
+
 def _prepare_moss_tts_request(
     payload: StagePayload,
     *,
@@ -477,8 +528,23 @@ def _prepare_moss_tts_request(
 ) -> MossTTSPreparedRequest:
     state = build_moss_tts_state(payload)
     ref_codes = resolve_moss_tts_ref_codes(payload, processor=processor)
-    message = _build_processor_message(processor, state, ref_codes)
-    batch = processor([[message]], mode="generation")
+    metadata = (
+        payload.request.metadata
+        if isinstance(payload.request.metadata, dict)
+        else {}
+    )
+    tts_params = metadata.get("tts_params")
+    continuation = (
+        bool(tts_params.get("continuation"))
+        if isinstance(tts_params, dict)
+        else False
+    )
+    if continuation and (ref_codes is not None or state.ref_audio is not None):
+        conversation = _build_continuation_conversation(processor, state, ref_codes)
+        batch = processor([conversation], mode="continuation")
+    else:
+        message = _build_processor_message(processor, state, ref_codes)
+        batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
         raise ValueError(
