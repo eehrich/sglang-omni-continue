@@ -17,7 +17,7 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.ref_codes import encode_reference_codes
+from sglang_omni.utils.ref_codes import encode_reference_codes
 from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
 from sglang_omni.proto import (
     MOSS_GENERATED_CODES_FIELD,

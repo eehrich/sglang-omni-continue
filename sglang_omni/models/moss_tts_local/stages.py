@@ -28,7 +28,7 @@ from sglang_omni.models.moss_tts_local.audio_tokenizer import (
 from sglang_omni.models.moss_tts_local.payload_types import (
     moss_tts_local_special_token_defaults,
 )
-from sglang_omni.models.moss_tts_local.ref_codes import (
+from sglang_omni.utils.ref_codes import (
     ADMIN_ENCODE_REFERENCE,
     CODEC_FRAMES_PER_SECOND,
     encode_reference_codes,

@@ -43,7 +43,7 @@ EXPLICIT_GENERATION_PARAMS_KEY = "explicit_generation_params"
 # The names live here, next to StagePayload, so the generic serve/client layer
 # can read the field without importing torch-backed model code (same reason as
 # ADMIN_MOSS_ENCODE_REFERENCE in proto/admin.py). The packing itself is in
-# models/moss_tts_local/ref_codes.py, which owns the format.
+# utils/ref_codes.py, which owns the format.
 MOSS_RETURN_CODES_PARAM = "return_codes"
 MOSS_GENERATED_CODES_FIELD = "generated_codes"
 

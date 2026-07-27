@@ -8,7 +8,7 @@ import base64
 import pytest
 import torch
 
-from sglang_omni.models.moss_tts_local.ref_codes import (
+from sglang_omni.utils.ref_codes import (
     MAX_REFERENCE_CODE_FRAMES,
     decode_reference_codes,
     encode_reference_codes,

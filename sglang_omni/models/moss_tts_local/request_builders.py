@@ -23,7 +23,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     resolve_moss_reference,
 )
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.ref_codes import (
+from sglang_omni.utils.ref_codes import (
     REF_CODES_PARAM,
     decode_reference_codes,
 )

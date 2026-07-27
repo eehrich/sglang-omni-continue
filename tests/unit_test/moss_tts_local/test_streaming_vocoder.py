@@ -25,7 +25,7 @@ from torch import nn
 
 from sglang_omni.models.moss_tts_local import stages
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.ref_codes import decode_reference_codes
+from sglang_omni.utils.ref_codes import decode_reference_codes
 from sglang_omni.models.moss_tts_local.request_builders import (
     build_moss_tts_local_stream_metadata,
 )

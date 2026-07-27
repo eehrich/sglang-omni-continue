@@ -20,6 +20,7 @@ from sglang_omni.sampling.seed import derive_sampling_seed, new_random_sampling_
 from sglang_omni.scheduling.prepared_request_queue import PreparedRequestQueue
 from sglang_omni.scheduling.types import ARRequestData
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
+from sglang_omni.utils.ref_codes import REF_CODES_PARAM, decode_reference_codes
 
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
@@ -381,7 +382,57 @@ def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
     return key_ids
 
 
-def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any] | None:
+def resolve_moss_tts_ref_codes(
+    payload: StagePayload,
+    *,
+    processor: Any,
+) -> torch.Tensor | None:
+    """Decode + validate pre-computed reference codes for one request.
+
+    Deliberately NOT a ``MossTTSState`` field: that state dict is msgpack'd on
+    the terminal stage hop, so a tensor parked on it kills the vocoder process,
+    and echoing the packed form through every stage would ship the reference
+    twice. The codes are a preprocessing-local input, consumed while the prompt
+    rows are built and never needed again.
+
+    Mirrors ``resolve_moss_reference`` on where it looks: a per-reference
+    descriptor wins over the flat ``tts_params`` field, and codes win over
+    ``ref_audio`` when both are present (same reference, already encoded).
+
+    Note the Delay model runs ``n_vq`` 32 against the Local Transformer's 12,
+    so codes cannot be carried across the two; the validator rejects the
+    mismatch instead of cloning a garbage voice from it.
+    """
+    inputs = payload.request.inputs or {}
+    metadata = payload.request.metadata or {}
+    tts_params = metadata.get("tts_params")
+    if not isinstance(tts_params, dict):
+        tts_params = {}
+    _, references = normalize_moss_tts_inputs(inputs)
+    reference = references[0] if references else {}
+    raw = reference.get(REF_CODES_PARAM) or tts_params.get(REF_CODES_PARAM)
+    if raw is None:
+        return None
+    cfg = processor.model_config
+    audio_vocab_size = int(
+        getattr(cfg, "audio_vocab_size", None) or getattr(cfg, "audio_pad_code", 1024)
+    )
+    return decode_reference_codes(
+        raw, n_vq=int(cfg.n_vq), audio_vocab_size=audio_vocab_size
+    )
+
+
+def _reference_for_processor(
+    processor: Any,
+    ref_audio: Any | None,
+    ref_codes: torch.Tensor | None = None,
+) -> list[Any] | None:
+    # Codes are what the encode below would have produced, so supplying them
+    # skips the encoder entirely -- which is also what makes a long re-anchored
+    # window usable here at all: encoding one in a single forward materialises
+    # O(T^2) attention state.
+    if ref_codes is not None:
+        return [ref_codes]
     if ref_audio is None:
         return None
     if not isinstance(ref_audio, str):
@@ -404,8 +455,12 @@ def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any]
     return [codes]
 
 
-def _build_processor_message(processor: Any, state: MossTTSState) -> dict[str, Any]:
-    reference = _reference_for_processor(processor, state.ref_audio)
+def _build_processor_message(
+    processor: Any,
+    state: MossTTSState,
+    ref_codes: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    reference = _reference_for_processor(processor, state.ref_audio, ref_codes)
     return processor.build_user_message(
         text=state.text,
         reference=reference,
@@ -421,7 +476,8 @@ def _prepare_moss_tts_request(
     processor: Any,
 ) -> MossTTSPreparedRequest:
     state = build_moss_tts_state(payload)
-    message = _build_processor_message(processor, state)
+    ref_codes = resolve_moss_tts_ref_codes(payload, processor=processor)
+    message = _build_processor_message(processor, state, ref_codes)
     batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:

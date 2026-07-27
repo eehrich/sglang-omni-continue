@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pre-computed reference codes for MOSS-TTS Local.
+"""Pre-computed reference codes for MOSS-TTS (Local and Delay).
+
+Model-agnostic on purpose: ``n_vq`` and ``audio_vocab_size`` are arguments, so
+the same decoder serves both the Local Transformer (n_vq 12) and Delay (n_vq
+32). Codes are NOT interchangeable between them -- the validator rejects a
+mismatched second dimension rather than cloning a garbage voice from it.
 
 The clone reference normally arrives as audio and is run through the ~1B-param
 MOSS-Audio-Tokenizer-v2 encoder on every request. That encode does not
