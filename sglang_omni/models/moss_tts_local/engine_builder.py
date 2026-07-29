@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 from sglang_omni.models.moss_tts_local import request_builders
@@ -80,6 +81,22 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
             self.profile_total_gpu_memory_fraction = None
 
     def customize_server_args(self, server_args: Any) -> None:
+        # Measurement escape hatch. MOSS requests key the radix cache on the
+        # prompt rows alone (build_row_cache_key_ids), so N seeds over the
+        # same prompt share ONE cached prefill: seed 2..N reuse seed 1's KV
+        # instead of prefilling themselves. For serving that is the point;
+        # for a seed-spread measurement it collapses N supposedly independent
+        # samples onto a single prefill. Env-gated because the pipeline
+        # config deliberately exposes no ServerArgs beyond
+        # mem_fraction_static (SGLangServerArgsConfig, extra="forbid").
+        if os.environ.get("SGLANG_OMNI_DISABLE_RADIX_CACHE", "").lower() in (
+            "1", "true", "yes",
+        ):
+            server_args.disable_radix_cache = True
+            moss_local_stages.logger.info(
+                "MOSS-TTS Local: radix cache DISABLED via "
+                "SGLANG_OMNI_DISABLE_RADIX_CACHE"
+            )
         moss_local_stages.logger.info(
             f"MOSS-TTS Local SGLang startup: gpu_id={self.gpu_id} "
             f"total_gpu_memory_fraction={self.total_gpu_memory_fraction} "
