@@ -41,6 +41,68 @@ from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeState
 
 logger = logging.getLogger(__name__)
 
+_LOGIT_DUMP_STATE: dict[str, Any] = {}
+
+
+def _logit_dump_sink(n_vq: int) -> Optional[Callable[[int, torch.Tensor, torch.Tensor], None]]:
+    """Per-channel audio-logit recorder for the eager decode path, or None.
+
+    Measurement instrument, not a feature. Comparing this engine's logits
+    against the transformers reference is the only way to tell a forward-pass
+    difference from a sampling difference, and the two have very different
+    fixes. Sampled trajectories diverge at the first differing argmax, so the
+    comparison is only meaningful frame by frame against a FORCED history --
+    the caller supplies that by putting the reference engine's codes into the
+    assistant slot and asking for one frame at a time.
+
+    Enabled by ``MOSS_LOGIT_DUMP=<path>``; writes one float16 record per
+    (frame, channel) as raw ``[vocab]`` rows plus a sidecar index. Off by
+    default and only reachable from ``decode_frame`` -- the CUDA-graph path
+    cannot host a Python callback, which is fine because the graph path only
+    runs without a repetition penalty and production sets one.
+
+    Batch>1 is refused rather than silently recorded: rows would interleave
+    and the file would look plausible while pairing frames wrongly.
+    """
+    path = os.environ.get("MOSS_LOGIT_DUMP")
+    if not path:
+        return None
+    state = _LOGIT_DUMP_STATE
+    if state.get("path") != path:
+        state.clear()
+        state["path"] = path
+        state["fh"] = open(path, "wb")
+        state["index"] = open(path + ".idx", "w", encoding="utf-8")
+        state["frame"] = 0
+        state["request"] = 0
+        logger.warning("MOSS-TTS Local: logit dump ACTIVE -> %s", path)
+    elif state.get("frame", 0) and not state.get("open_request"):
+        # New request against an already-open file: mark the boundary, or two
+        # sequential requests read as one continuous stream and frames pair
+        # against the wrong prompt.
+        state["request"] = int(state.get("request", 0)) + 1
+        state["index"].write("# request %d\n" % state["request"])
+    state["open_request"] = True
+
+    def record(channel: int, logits: torch.Tensor, code: torch.Tensor) -> None:
+        if int(logits.shape[0]) != 1:
+            raise RuntimeError(
+                "MOSS_LOGIT_DUMP requires batch size 1; got "
+                f"{int(logits.shape[0])} rows -- run the dump against a single "
+                "request so frames cannot interleave"
+            )
+        row = logits[0].detach().to(dtype=torch.float16, device="cpu").numpy()
+        state["fh"].write(row.tobytes())
+        state["index"].write(
+            f"{state['frame']}\t{channel}\t{int(code[0])}\t{row.shape[0]}\n"
+        )
+        if channel + 1 == n_vq:
+            state["frame"] += 1
+            state["fh"].flush()
+            state["index"].flush()
+
+    return record
+
 
 def _as_qwen3_config(config: Any) -> Any:
     from transformers import Qwen3Config
@@ -604,10 +666,21 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
         codes = []
         current = local_hidden
+        dump = _logit_dump_sink(int(self.n_vq))
         for channel in range(self.n_vq):
             head_weight = self._audio_embedding_weight(channel)
             logits = F.linear(current, head_weight)
+            # Cloned BEFORE sampling: sample_audio applies the repetition
+            # penalty in place (model_runner._apply_..._mask -> logits.copy_).
+            # With bfloat16 weights .float() makes a copy and the penalty
+            # misses this tensor; with --dtype float32 it is a no-op and the
+            # penalty lands on it. Dumping afterwards would therefore record a
+            # different STAGE depending on dtype, and a comparison would blame
+            # the forward pass for it.
+            raw_logits = logits.detach().clone() if dump is not None else None
             code = sample_audio(logits.float(), channel)
+            if dump is not None:
+                dump(channel, raw_logits, code)
             codes.append(code)
             if channel + 1 < self.n_vq:
                 next_embed = F.embedding(code, head_weight)
