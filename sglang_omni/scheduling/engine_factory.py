@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -11,6 +14,8 @@ from sglang_omni.scheduling.generation_batch_policy import (
     validate_generation_batch_policy,
 )
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 class TtsEngineBuilder(ABC):
@@ -136,7 +141,31 @@ class TtsEngineBuilder(ABC):
         del overrides
 
     def customize_server_args(self, server_args: Any) -> None:
-        del server_args
+        """Hook for per-model ServerArgs tweaks; also the radix-cache switch.
+
+        Measurement escape hatch, shared by every model on purpose. TTS
+        requests key the radix cache on their prompt rows, so N seeds over one
+        prompt share a single cached prefill: seeds 2..N reuse seed 1's KV
+        instead of prefilling themselves. For serving that is the point; for a
+        seed-spread measurement it collapses N supposedly independent samples
+        onto one prefill.
+
+        It lives in the base class because putting it in one model's builder
+        left the others silently without it -- which is exactly how an 8B run
+        was measured with the cache still on. Pipeline config cannot carry it:
+        SGLangServerArgsConfig is extra="forbid" and exposes only
+        mem_fraction_static.
+
+        Overrides must call ``super().customize_server_args(server_args)``.
+        """
+        if os.environ.get("SGLANG_OMNI_DISABLE_RADIX_CACHE", "").lower() in (
+            "1", "true", "yes",
+        ):
+            server_args.disable_radix_cache = True
+            logger.info(
+                "radix cache DISABLED via SGLANG_OMNI_DISABLE_RADIX_CACHE (%s)",
+                type(self).__name__,
+            )
 
     def infra_kwargs(self) -> dict[str, Any]:
         return {}
