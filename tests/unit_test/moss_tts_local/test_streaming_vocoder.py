@@ -1719,10 +1719,15 @@ def test_continuation_decodes_prefix_as_context_and_trims_it(monkeypatch) -> Non
 
     # The echo stays the generated codes: a caller chaining segments feeds
     # them into the next request's prefix, and the prefix must not come back.
-    echoed = decode_reference_codes(result.data[MOSS_GENERATED_CODES_FIELD])
-    np.testing.assert_array_equal(
-        torch.as_tensor(echoed).numpy(), new[:, 1:].numpy()
+    packed = result.data[MOSS_GENERATED_CODES_FIELD]
+    assert packed["shape"] == [int(new.shape[0]), N_VQ]
+    echoed = decode_reference_codes(
+        packed, n_vq=N_VQ, audio_vocab_size=AUDIO_VOCAB_SIZE
     )
+    torch.testing.assert_close(echoed, new[:, 1:].to(torch.long))
+    # Neither the codes nor the context survive into the response: the terminal
+    # hop is msgpack'd, and a caller must not see the prefix twice.
+    assert result.data.get("audio_codes") is None
     assert result.data.get("audio_context_codes") is None
 
 
