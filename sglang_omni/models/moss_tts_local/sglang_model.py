@@ -44,6 +44,16 @@ logger = logging.getLogger(__name__)
 _LOGIT_DUMP_STATE: dict[str, Any] = {}
 
 
+def logit_dump_enabled() -> bool:
+    """True while ``MOSS_LOGIT_DUMP`` names a dump target.
+
+    Read by the model runner to keep frame decode on the eager path: the
+    recorder in ``decode_frame`` is a Python callback and a captured CUDA
+    graph cannot host one.
+    """
+    return bool(os.environ.get("MOSS_LOGIT_DUMP"))
+
+
 def _logit_dump_sink(n_vq: int) -> Optional[Callable[[int, torch.Tensor, torch.Tensor], None]]:
     """Per-channel audio-logit recorder for the eager decode path, or None.
 
@@ -58,8 +68,11 @@ def _logit_dump_sink(n_vq: int) -> Optional[Callable[[int, torch.Tensor, torch.T
     Enabled by ``MOSS_LOGIT_DUMP=<path>``; writes one float16 record per
     (frame, channel) as raw ``[vocab]`` rows plus a sidecar index. Off by
     default and only reachable from ``decode_frame`` -- the CUDA-graph path
-    cannot host a Python callback, which is fine because the graph path only
-    runs without a repetition penalty and production sets one.
+    cannot host a Python callback, so the runner routes every frame through
+    the eager path while the dump is on (``logit_dump_enabled``). Without
+    that the dump would only ever see requests that set a repetition
+    penalty, and a measurement could not switch the penalty off to test
+    whether the penalty itself is the difference.
 
     Batch>1 is refused rather than silently recorded: rows would interleave
     and the file would look plausible while pairing frames wrongly.

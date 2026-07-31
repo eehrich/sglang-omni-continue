@@ -10,6 +10,7 @@ import torch
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
+from sglang_omni.models.moss_tts_local.sglang_model import logit_dump_enabled
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import RequestOutput
@@ -332,7 +333,11 @@ class MossTTSLocalModelRunner(ModelRunner):
         except AttributeError:
             frame_graph_max_bs = 0
         use_graph = (
-            not has_audio_repetition_penalty and batch_size <= frame_graph_max_bs
+            not has_audio_repetition_penalty
+            and batch_size <= frame_graph_max_bs
+            # The logit recorder lives in the eager decode_frame and a captured
+            # graph cannot call back into Python. Off in production.
+            and not logit_dump_enabled()
         )
         if use_graph:
             stop_choice, codes, feedback = self.model.decode_frame_graphed(
