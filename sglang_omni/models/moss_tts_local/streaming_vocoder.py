@@ -452,6 +452,20 @@ class MossTTSLocalStreamingVocoderScheduler(
                 if isinstance(source.request.params, dict)
                 else None
             )
+            if self._continuation_requested(source):
+                # Chunked streaming decodes into a freshly zeroed codec slot,
+                # so the continuation prefix cannot prime it the way the
+                # batch path does (_prepare_codes). The first chunk of such a
+                # segment therefore still starts the decoder cold. Said out
+                # loud rather than left to be discovered: the non-streaming
+                # path is what production uses, and priming the slot means
+                # carrying leftover samples across chunk boundaries.
+                logger.warning(
+                    "MOSS-TTS Local: request %s streams chunked continuation -- "
+                    "the codec slot is not primed with the prefix, so the "
+                    "opening of this segment decodes without context",
+                    request_id,
+                )
             self._latch_thresholds(request_id, state, params)
             return
         metadata: Mapping[str, Any] = source
@@ -737,25 +751,73 @@ class MossTTSLocalStreamingVocoderScheduler(
         rows = torch.as_tensor(state.audio_codes, dtype=torch.long)
         if rows.numel() == 0:
             return None
+        # Same continuation context as the batch path: a streaming request that
+        # never produced a chunk still decodes its whole segment here, so it
+        # would otherwise start the codec cold.
+        context = self._context_frames(state)
+        context_frames = 0 if context is None else int(context.shape[0])
+        if context is not None:
+            rows = torch.cat([context, rows[:, : self._n_vq].contiguous()], dim=0)
+        total_frames = int(rows.shape[0])
         codes = rows[:, : self._n_vq].transpose(0, 1).contiguous()
         self._session_used_by_streaming = True
-        return self._ensure_session_graphed().decode_offline(
+        wav = self._ensure_session_graphed().decode_offline(
             [codes],
             max_step_frames=self._max_step_frames,
             max_batch_size=self._max_batch_size,
         )[0]
+        return self._trim_context(wav, context_frames, total_frames)
+
+    def _context_frames(self, state: MossTTSLocalState) -> torch.Tensor | None:
+        """The continuation prefix to decode in front of the generated rows.
+
+        Returns ``None`` when there is none (every clone request, and any
+        continuation whose prefix did not survive the stage hop).
+        """
+        context = getattr(state, "audio_context_codes", None)
+        if context is None:
+            return None
+        rows = torch.as_tensor(context, dtype=torch.long)
+        if rows.ndim != 2 or rows.numel() == 0:
+            return None
+        return rows[:, : self._n_vq].contiguous()
 
     def _prepare_codes(
         self, payload: StagePayload
-    ) -> tuple[MossTTSLocalState, torch.Tensor | None]:
+    ) -> tuple[MossTTSLocalState, torch.Tensor | None, int]:
+        """``(state, rows to decode, leading frames to drop from the audio)``.
+
+        On a continuation the prefix is decoded IN FRONT of the generated rows
+        and cut off again afterwards, because the codec decoder carries state:
+        starting it cold on the new frames alone was measured at roughly ten
+        semitones too high at the segment start, recovering over about ten
+        seconds. Same shape as ``voxtral_tts`` warmup frames, only that the
+        context here is the real preceding audio rather than a repeated frame.
+        """
         state = MossTTSLocalState.from_dict(payload.data)
         if state.audio_codes is None:
             raise RuntimeError("MOSS-TTS Local vocoder requires audio_codes")
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
         if codes.numel() == 0:
             # Emit no audio: only this request fails downstream, not the batch.
-            return state, None
-        return state, codes
+            return state, None, 0
+        context = self._context_frames(state)
+        if context is None:
+            return state, codes, 0
+        rows = torch.cat([context, codes[:, : self._n_vq].contiguous()], dim=0)
+        return state, rows, int(context.shape[0])
+
+    @staticmethod
+    def _continuation_requested(payload: StagePayload) -> bool:
+        """Did this request put its prior audio in the assistant slot?"""
+        request = getattr(payload, "request", None)
+        metadata = getattr(request, "metadata", None)
+        if not isinstance(metadata, dict):
+            return False
+        tts_params = metadata.get("tts_params")
+        if not isinstance(tts_params, dict):
+            return False
+        return bool(tts_params.get("continuation"))
 
     @staticmethod
     def _return_codes_requested(payload: StagePayload) -> bool:
@@ -819,6 +881,9 @@ class MossTTSLocalStreamingVocoderScheduler(
             state.audio_codes if self._return_codes_requested(payload) else None
         )
         state.audio_codes = None
+        # Decoder context, not a result: it must not travel back to the caller,
+        # who would otherwise see the prefix twice when chaining segments.
+        state.audio_context_codes = None
         state.sample_rate = self._sample_rate
         payload.data = state.to_dict()
         payload.data.update(audio_payload)
@@ -908,18 +973,59 @@ class MossTTSLocalStreamingVocoderScheduler(
             )
         return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
+    def _trim_context(
+        self, wav: torch.Tensor, context_frames: int, total_frames: int
+    ) -> torch.Tensor:
+        """Drop the samples belonging to the decoded prefix.
+
+        The samples-per-frame ratio is taken from THIS decode rather than from
+        ``sample_rate / 12.5``: both decode branches emit whole frames (the
+        offline lane concatenates per-step ``audio_lengths``, the non-stream
+        lane slices by them), so the division is exact, and deriving it here
+        cannot drift if the codec's rate ever changes. A remainder means that
+        assumption broke -- fall back to the proportional cut, but say so,
+        because that is the interesting event, not the half sample.
+        """
+        if context_frames <= 0 or total_frames <= 0:
+            return wav
+        samples = int(wav.shape[-1])
+        per_frame, remainder = divmod(samples, total_frames)
+        if remainder:
+            logger.warning(
+                "MOSS-TTS Local vocoder: %d samples over %d frames is not a "
+                "whole ratio -- trimming the prefix proportionally",
+                samples,
+                total_frames,
+            )
+            offset = int(round(context_frames * samples / total_frames))
+        else:
+            offset = context_frames * per_frame
+        if offset >= samples:
+            logger.error(
+                "MOSS-TTS Local vocoder: prefix of %d frames covers the whole "
+                "decode (%d samples) -- not trimming",
+                context_frames,
+                samples,
+            )
+            return wav
+        return wav[..., offset:].contiguous()
+
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         prepared = [self._prepare_codes(payload) for payload in payloads]
-        codes_list = [codes for _, codes in prepared if codes is not None]
+        codes_list = [codes for _, codes, _ in prepared if codes is not None]
         decoded = iter(self._decode_codes_rows(codes_list)) if codes_list else iter(())
         results = []
-        for payload, (state, codes) in zip(payloads, prepared):
+        for payload, (state, codes, context_frames) in zip(payloads, prepared):
             if codes is None:
                 state.audio_codes = None
+                state.audio_context_codes = None
                 payload.data = state.to_dict()
                 results.append(payload)
                 continue
-            results.append(self._store_vocoder_result(payload, state, next(decoded)))
+            wav = self._trim_context(
+                next(decoded), context_frames, int(codes.shape[0])
+            )
+            results.append(self._store_vocoder_result(payload, state, wav))
         return results
 
     def _vocode(self, payload: StagePayload) -> StagePayload:

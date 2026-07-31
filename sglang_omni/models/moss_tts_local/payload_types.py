@@ -45,3 +45,12 @@ class MossTTSLocalState(DeclarativeStateBase):
     token_count: int | None = wire(None, codec="opt_int")
     generation_kwargs: dict[str, Any] = wire(default_factory=dict, codec="dict")
     audio_codes: Any | None = wire(None, codec="tensor_cpu")
+    # Continuation only: the assistant-slot prefix, carried to the vocoder as
+    # DECODER CONTEXT. The codec is not memoryless -- decoding the new frames
+    # alone starts it cold, and measured against the transformers reference
+    # that costs about ten semitones at the segment start, recovering over
+    # roughly ten seconds. The reference decodes prefix+new and cuts the audio
+    # afterwards; this field is what lets the vocoder do the same.
+    # NOT the returned codes: ``audio_codes`` stays the generated rows, because
+    # a caller chaining segments feeds them into the next request's prefix.
+    audio_context_codes: Any | None = wire(None, codec="tensor_cpu")

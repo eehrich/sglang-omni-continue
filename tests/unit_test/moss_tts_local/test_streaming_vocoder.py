@@ -1652,3 +1652,116 @@ def test_low_vram_capture_attempted_once_no_reprobe(monkeypatch) -> None:
     np.testing.assert_array_equal(
         _concat_stream_audio(messages, "s"), reference_waveform(rows[:, 1:]).numpy()
     )
+
+
+def _continuation_payload(
+    rows: torch.Tensor,
+    prefix_rows: torch.Tensor,
+    request_id: str,
+) -> StagePayload:
+    """An offline payload that carries a continuation prefix as decoder context."""
+    state = MossTTSLocalState(
+        text="x",
+        audio_codes=rows[:, 1:].clone(),
+        audio_context_codes=prefix_rows[:, 1:].clone(),
+        prompt_tokens=2,
+        completion_tokens=int(rows.shape[0]),
+        engine_time_s=0.25,
+    )
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(
+            inputs="",
+            params={},
+            metadata={"tts_params": {"continuation": True, "return_codes": True}},
+        ),
+        data=state.to_dict(),
+    )
+
+
+def test_continuation_decodes_prefix_as_context_and_trims_it(monkeypatch) -> None:
+    """The prefix must reach the codec and must not reach the caller.
+
+    This is the defect the whole continuation investigation ended at: the
+    engine handed the vocoder only the newly generated frames, so the codec
+    started cold on every segment while the transformers reference decoded
+    prefix+new and cut the audio afterwards. Measured against that reference,
+    the cold start was about ten semitones too high and took some ten seconds
+    to settle.
+
+    FakeCodec makes it numerically visible: frame ``t`` decodes to
+    ``sum(codes) + 1000 * offset`` with the slot's CUMULATIVE offset, so a
+    decode that saw 5 prefix frames first produces different sample values
+    than one that did not -- exactly the way the real codec's carried state
+    changes its output.
+    """
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(monkeypatch, processor)
+
+    prefix = _rows(5, seed=90)
+    new = _rows(7, seed=91)
+    result = scheduler._vocode_batch([_continuation_payload(new, prefix, "c1")])[0]
+    audio = _decode_audio(result.data)
+
+    # Length is the NEW frames only -- the prefix samples are cut off again.
+    assert audio.shape[-1] == int(new.shape[0]) * SAMPLES_PER_FRAME
+
+    # Value check: the tail of a joint decode of [prefix + new], NOT the
+    # stand-alone decode of new. The two differ precisely because the codec
+    # carried the prefix's offsets into the new frames.
+    joint = reference_waveform(torch.cat([prefix, new], dim=0)[:, 1:])
+    expected = joint[..., int(prefix.shape[0]) * SAMPLES_PER_FRAME :]
+    np.testing.assert_array_equal(audio, expected.numpy())
+    alone = reference_waveform(new[:, 1:]).numpy()
+    assert not np.array_equal(audio, alone), (
+        "context made no difference -- the prefix never reached the decoder"
+    )
+
+    # The echo stays the generated codes: a caller chaining segments feeds
+    # them into the next request's prefix, and the prefix must not come back.
+    echoed = decode_reference_codes(result.data[MOSS_GENERATED_CODES_FIELD])
+    np.testing.assert_array_equal(
+        torch.as_tensor(echoed).numpy(), new[:, 1:].numpy()
+    )
+    assert result.data.get("audio_context_codes") is None
+
+
+def test_clone_without_context_is_unchanged(monkeypatch) -> None:
+    """No prefix, no trim: the clone path must decode exactly as before."""
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(monkeypatch, processor)
+
+    rows = _rows(9, seed=92)
+    result = scheduler._vocode_batch([_offline_payload(rows, "c2")])[0]
+    np.testing.assert_array_equal(
+        _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
+    )
+
+
+def test_continuation_and_clone_batch_together(monkeypatch) -> None:
+    """One batch, one with context and one without -- neither may bleed.
+
+    The prefix is prepended per payload before a shared decode, so a wrong
+    index here would trim the wrong take. Padding to the longest row makes
+    that easy to get wrong and impossible to notice on single-request tests.
+    """
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(monkeypatch, processor)
+
+    prefix = _rows(4, seed=93)
+    with_ctx = _rows(6, seed=94)
+    without = _rows(11, seed=95)
+    results = scheduler._vocode_batch(
+        [
+            _continuation_payload(with_ctx, prefix, "c3"),
+            _offline_payload(without, "c4"),
+        ]
+    )
+    joint = reference_waveform(torch.cat([prefix, with_ctx], dim=0)[:, 1:])
+    np.testing.assert_array_equal(
+        _decode_audio(results[0].data),
+        joint[..., int(prefix.shape[0]) * SAMPLES_PER_FRAME :].numpy(),
+    )
+    np.testing.assert_array_equal(
+        _decode_audio(results[1].data), reference_waveform(without[:, 1:]).numpy()
+    )

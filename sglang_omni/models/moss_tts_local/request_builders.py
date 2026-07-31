@@ -52,6 +52,9 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     state: MossTTSLocalState = field(default_factory=MossTTSLocalState)
     model_config: Any = None
     prompt_rows: torch.Tensor | None = None
+    # Continuation only: the assistant-slot prefix, handed to the vocoder as
+    # decoder context in apply_sglang_moss_tts_local_result.
+    prefix_codes: torch.Tensor | None = None
     output_rows: list[torch.Tensor] = field(default_factory=list)
     # note (Yue Yin): checkpoint generate() defaults — the continue/stop head samples at
     # temperature 1.0 while audio channels use the model-card values (1.7 / 0.8 / 25, no rep penalty).
@@ -77,6 +80,12 @@ class MossTTSLocalPreparedRequest:
     input_ids: torch.Tensor
     prompt_rows: torch.Tensor
     gen_kwargs: dict[str, Any]
+    # Continuation only: the assistant-slot prefix, kept for the VOCODER.
+    # Process-local on purpose -- putting it on the state here would send a
+    # tensor across the preprocessing hop (preprocess_moss_tts_local_payload
+    # serialises state.to_dict()), where none travels today. It joins the
+    # state at the AR hop instead, next to audio_codes.
+    prefix_codes: torch.Tensor | None = None
 
 
 @dataclass
@@ -332,8 +341,8 @@ def _encode_prior_audio_codes(
 def _build_continuation_conversation(
     processor: Any,
     state: MossTTSLocalState,
-    reference_encoder: Any = None,
-    ref_codes: torch.Tensor | None = None,
+    *,
+    prior_codes: torch.Tensor,
 ) -> list[dict[str, Any]]:
     """Build a [user(full text), assistant(prior audio)] continuation turn.
 
@@ -343,10 +352,10 @@ def _build_continuation_conversation(
     fresh clone. ``state.text`` already carries the full concatenated text
     (previous + new) and ``state.token_count`` the TOTAL (prefix + new)
     duration hint, mirroring the reference MOSSVoiceContinue node.
+
+    ``prior_codes`` is resolved by the caller because the vocoder needs the
+    same rows as decoder context; see ``_prepare_moss_tts_local_request``.
     """
-    prior_codes = _encode_prior_audio_codes(
-        processor, state, reference_encoder, ref_codes
-    )
     user_message = processor.build_user_message(
         text=state.text,
         reference=None,
@@ -379,9 +388,17 @@ def _prepare_moss_tts_local_request(
         if isinstance(tts_params, dict)
         else False
     )
+    prefix_codes: torch.Tensor | None = None
     if continuation and (ref_codes is not None or state.ref_audio is not None):
-        conversation = _build_continuation_conversation(
+        # Resolved here rather than inside the conversation builder: the same
+        # rows are needed twice -- as the assistant slot AND as decoder context
+        # for the vocoder -- and encoding them twice would run the codec
+        # encoder a second time.
+        prefix_codes = _encode_prior_audio_codes(
             processor, state, reference_encoder, ref_codes
+        )
+        conversation = _build_continuation_conversation(
+            processor, state, prior_codes=prefix_codes
         )
         batch = processor([conversation], mode="continuation")
     else:
@@ -402,6 +419,11 @@ def _prepare_moss_tts_local_request(
         input_ids=torch.tensor(input_ids_list, dtype=torch.long),
         prompt_rows=prompt_rows,
         gen_kwargs=state.generation_kwargs,
+        prefix_codes=(
+            None
+            if prefix_codes is None
+            else prefix_codes.detach().to("cpu", torch.long)
+        ),
     )
 
 
@@ -509,6 +531,7 @@ def build_sglang_moss_tts_local_request(
         state=prepared.state,
         model_config=cfg,
         prompt_rows=prepared.prompt_rows,
+        prefix_codes=prepared.prefix_codes,
         text_temperature=float(gen_kwargs.get("text_temperature", 1.0)),
         text_top_p=float(gen_kwargs.get("text_top_p", 1.0)),
         text_top_k=int(gen_kwargs.get("text_top_k", 50)),
@@ -547,6 +570,16 @@ def apply_sglang_moss_tts_local_result(
         state.audio_codes = generated_rows[:, 1:].detach().cpu()
     else:
         state.audio_codes = torch.empty((0, n_vq), dtype=torch.long)
+
+    # Decoder context for the vocoder, NOT part of the result. The codec keeps
+    # state across frames, so decoding the generated rows alone starts it cold:
+    # measured against the transformers reference that is about ten semitones
+    # too high at the segment start and settles over some ten seconds. The
+    # reference decodes prefix+new and cuts the audio afterwards; the vocoder
+    # does the same with this field (streaming_vocoder._prepare_codes) and
+    # clears it before the response leaves. ``audio_codes`` stays the generated
+    # rows, because a caller chaining segments feeds them into the next prefix.
+    state.audio_context_codes = data.prefix_codes
 
     state.prompt_tokens = len(data.input_ids) if data.input_ids is not None else 0
     state.completion_tokens = len(data.output_rows)
