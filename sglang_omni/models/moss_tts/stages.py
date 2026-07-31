@@ -8,7 +8,10 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
+from sglang_omni.models.moss_tts.codec import (
+    split_moss_audio_segments,
+    split_moss_audio_segments_with_prefix,
+)
 from sglang_omni.models.moss_tts.hf_loading import (
     load_moss_processor_class,
     moss_transformers_processor_compat,
@@ -42,6 +45,42 @@ from sglang_omni.utils.ref_codes import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _drop_prefix_samples(
+    waveform: torch.Tensor, prefix_frames: int, segment_frames: int
+) -> torch.Tensor:
+    """Cut the samples the continuation prefix produced off the front.
+
+    The samples-per-frame ratio comes from THIS decode rather than from a
+    configured rate: the codec emits whole frames, so the division is exact,
+    and deriving it here cannot drift if the rate ever changes. A remainder
+    means that assumption broke -- fall back to a proportional cut and say so,
+    because the broken assumption is the interesting part, not the half sample.
+    """
+    if prefix_frames <= 0 or segment_frames <= 0:
+        return waveform
+    samples = int(waveform.shape[-1])
+    per_frame, remainder = divmod(samples, segment_frames)
+    if remainder:
+        logger.warning(
+            "MOSS-TTS vocoder: %d samples over %d frames is not a whole ratio "
+            "-- cutting the prefix proportionally",
+            samples,
+            segment_frames,
+        )
+        offset = int(round(prefix_frames * samples / segment_frames))
+    else:
+        offset = prefix_frames * per_frame
+    if offset >= samples:
+        logger.error(
+            "MOSS-TTS vocoder: prefix of %d frames covers the whole segment "
+            "(%d samples) -- not cutting",
+            prefix_frames,
+            samples,
+        )
+        return waveform
+    return waveform[..., offset:].contiguous()
 
 _MOSS_TTS_INSTALL_HINT = (
     "MOSS-TTS support requires the upstream custom Transformers code. "
@@ -232,7 +271,14 @@ class _MossTTSVocoder(BatchVocoderBase):
                 1024,
             )
         )
-        segments = split_moss_audio_segments(
+        # The prefix STAYS in the codes here and is cut off the audio below:
+        # the codec carries state across frames, so decoding a continuation's
+        # new frames alone starts it cold. Measured on the 1.7B path, where
+        # the same defect sat one layer later, that is about ten semitones too
+        # high at the segment start, settling over some ten seconds. The echo
+        # (_pack_generated_codes) keeps cutting the CODES -- a caller chains
+        # them into the next request and must not get the prefix back.
+        segments, prefix_frames = split_moss_audio_segments_with_prefix(
             delayed_codes,
             audio_pad_code=audio_pad_code,
             assistant_start_length=int(state.assistant_start_length),
@@ -245,6 +291,9 @@ class _MossTTSVocoder(BatchVocoderBase):
         waveforms = [
             torch.as_tensor(wav).detach().reshape(-1).to("cpu") for wav in decoded
         ]
+        waveforms[0] = _drop_prefix_samples(
+            waveforms[0], prefix_frames, int(segments[0].shape[0])
+        )
         waveform = torch.cat(waveforms, dim=0)
         sample_rate = int(
             getattr(getattr(self._processor, "model_config", None), "sampling_rate", 0)

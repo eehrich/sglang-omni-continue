@@ -1453,3 +1453,70 @@ def test_moss_preprocess_pre_start_abort_does_not_block(
         assert not snap.inflight
     finally:
         rb.clear_moss_tts_preprocessing_context()
+
+
+def test_moss_delay_codec_keeps_prefix_for_decoding_but_reports_it() -> None:
+    """The prefix stays in the codes for decoding and is only REPORTED.
+
+    Two callers need opposite things from the same split, which is why the
+    amount is computed here and applied by whoever asks:
+
+    * the echo hands codes back to a caller who chains them into the next
+      request -- there the prefix has to go, or it returns doubled;
+    * the decode hands codes to the codec, which carries state across frames
+      -- there the prefix is the context that makes a continuation sound like
+      one, and only the samples it produced get dropped afterwards.
+
+    Cutting it for both, as this module did, started the codec cold on every
+    continuation: measured on the 1.7B path, ten semitones too high at the
+    segment start.
+    """
+    from sglang_omni.models.moss_tts.codec import (
+        split_moss_audio_segments_with_prefix,
+    )
+
+    # Four decodable frames after the delay reversal; the first two stand for
+    # the assistant-slot prefix.
+    delayed = torch.tensor(
+        [[1, 1024], [2, 3], [5, 4], [7, 6], [1024, 8], [1024, 1024]],
+        dtype=torch.long,
+    )
+
+    kept, prefix_frames = split_moss_audio_segments_with_prefix(
+        delayed, audio_pad_code=1024, assistant_start_length=2
+    )
+    cut = split_moss_audio_segments(
+        delayed, audio_pad_code=1024, assistant_start_length=2
+    )
+
+    assert prefix_frames == 2
+    assert len(kept) == 1 and len(cut) == 1
+    # The decode view keeps every frame; the echo view is exactly it minus the
+    # reported prefix. Stated as a relation, so the test cannot pass by both
+    # sides being trimmed the same way.
+    assert kept[0].shape[0] == cut[0].shape[0] + prefix_frames
+    torch.testing.assert_close(kept[0][prefix_frames:], cut[0])
+
+    # Without a prefix the two views coincide -- the clone path must not move.
+    kept_plain, none_frames = split_moss_audio_segments_with_prefix(
+        delayed, audio_pad_code=1024
+    )
+    assert none_frames == 0
+    torch.testing.assert_close(
+        kept_plain[0], split_moss_audio_segments(delayed, audio_pad_code=1024)[0]
+    )
+
+
+def test_moss_drop_prefix_samples_cuts_whole_frames() -> None:
+    """Samples per frame come from the decode itself, not from a constant."""
+    from sglang_omni.models.moss_tts.stages import _drop_prefix_samples
+
+    wav = torch.arange(40, dtype=torch.float32)  # 4 frames x 10 samples
+    torch.testing.assert_close(
+        _drop_prefix_samples(wav, 1, 4), torch.arange(10, 40, dtype=torch.float32)
+    )
+    # Nothing to drop, nothing dropped.
+    torch.testing.assert_close(_drop_prefix_samples(wav, 0, 4), wav)
+    # A prefix covering everything would leave an empty take: refuse instead,
+    # because handing back silence is worse than handing back too much.
+    torch.testing.assert_close(_drop_prefix_samples(wav, 4, 4), wav)
