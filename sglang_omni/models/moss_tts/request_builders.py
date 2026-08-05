@@ -90,6 +90,11 @@ class MossTTSSGLangRequestData(ARRequestData):
     seed: int | None = None
     sampling_seed: int = field(default_factory=_new_moss_tts_sampling_seed)
     delay_state: torch.Tensor | None = None
+    # Schwanz des ROHEN Prefix-Rasters, [n_vq-1, n_vq]: die Frames, deren
+    # feine Codes die Truncation abgeschnitten hat. seam_step zaehlt die
+    # erzeugten Audiozeilen, solange davon noch etwas offen ist.
+    seam_tail: torch.Tensor | None = None
+    seam_step: int = 0
     audio_length: int = 0
     delayed_length: int = _INF_DELAY
     is_audio: bool = False
@@ -105,6 +110,9 @@ class MossTTSPreparedRequest:
     input_ids: torch.Tensor
     prompt_rows: torch.Tensor
     gen_kwargs: dict[str, Any]
+    # Nur bei Continuation gesetzt: das rohe Prefix-Raster [T, n_vq], aus dem
+    # die abgeschnittenen Zellen der Delay-Naht stammen.
+    prefix_codes: Any = None
 
 
 @dataclass
@@ -539,9 +547,13 @@ def _prepare_moss_tts_request(
         if isinstance(tts_params, dict)
         else False
     )
+    prefix_codes = None
     if continuation and (ref_codes is not None or state.ref_audio is not None):
         conversation = _build_continuation_conversation(processor, state, ref_codes)
         batch = processor([conversation], mode="continuation")
+        # Vor der Delay-Faltung festhalten: der Prozessor schneidet gleich die
+        # Auslauf-Rampe ab, und danach sind diese Werte nicht mehr ableitbar.
+        prefix_codes = _continuation_prefix_codes(conversation)
     else:
         message = _build_processor_message(processor, state, ref_codes)
         batch = processor([[message]], mode="generation")
@@ -558,7 +570,30 @@ def _prepare_moss_tts_request(
         input_ids=torch.tensor(input_ids_list, dtype=torch.long),
         prompt_rows=prompt_rows,
         gen_kwargs=state.generation_kwargs,
+        prefix_codes=prefix_codes,
     )
+
+
+def _continuation_prefix_codes(conversation: list) -> Any:
+    """Rohes [T, n_vq] Raster aus der Assistant-Nachricht der Continuation.
+
+    Genommen wird die Nachricht, die in den ASSISTANT-Slot geht -- das ist der
+    Prefix, den das Modell fortsetzt. Fehlt sie oder hat sie eine andere Form,
+    gibt es None und die Naht bleibt wie bisher (das Modell raet); ein
+    fehlender Schwanz darf keine Anfrage scheitern lassen.
+    """
+    for message in reversed(conversation):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        codes_list = message.get("audio_codes_list") or []
+        if not codes_list:
+            return None
+        codes = codes_list[-1]
+        shape = getattr(codes, "shape", None)
+        if shape is None or len(shape) != 2 or int(shape[0]) < 2:
+            return None
+        return codes
+    return None
 
 
 def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
@@ -632,6 +667,36 @@ def _resolve_audio_payload_bounds(
     if end <= start or end <= start + n_vq:
         return None
     return start, end
+
+
+def _seed_seam_tail(
+    data: MossTTSSGLangRequestData,
+    prefix_codes: Any,
+    *,
+    model: Any,
+) -> None:
+    """Letzte n_vq-1 Frames des Rohrasters an die Anfrage haengen.
+
+    Genau diese Frames hat die Truncation halbiert: ihre feinen Codes stehen
+    in den Zeilen, die der Prozessor abgeschnitten hat. Der Sampler setzt sie
+    aus diesem Schwanz wieder ein, statt sie erzeugen zu lassen.
+    """
+    if prefix_codes is None:
+        return
+    n_vq = int(getattr(model.config, "n_vq", 0) or 0)
+    if n_vq < 2:
+        return
+    try:
+        tail = torch.as_tensor(prefix_codes, dtype=torch.long)
+    except Exception:  # noqa: BLE001 - ein unbrauchbarer Schwanz ist kein Fehler
+        return
+    if tail.ndim != 2 or int(tail.shape[1]) != n_vq:
+        return
+    span = n_vq - 1
+    if int(tail.shape[0]) < span:
+        return
+    data.seam_tail = tail[-span:].detach().clone()
+    data.seam_step = 0
 
 
 def _initialize_generation_state(
@@ -723,6 +788,7 @@ def build_sglang_moss_tts_request(
         engine_start_s=time.perf_counter(),
     )
     data.input_embeds_are_projected = True
+    _seed_seam_tail(data, prepared.prefix_codes, model=model)
     _initialize_generation_state(data, model=model)
     data.stage_payload = payload
     return data

@@ -416,6 +416,34 @@ class MossTTSModelRunner(ModelRunner):
                 positions=gen_steps[audio_rows] * num_channels + (audio_chans + 1),
             )
 
+        # --- Delay-Naht: bekannte Prefix-Zellen setzen statt raten ---------
+        # Der Prozessor schneidet im Continuation-Modus die Auslauf-Rampe des
+        # Prefix ab. Dadurch fehlen den letzten n_vq-1 Prefix-Frames ihre
+        # feinen Codes, und das Modell liefert sie mit seinen ersten Zeilen
+        # nach -- es RAET Detail von Audio, das laengst feststeht, und ein
+        # Fehlgriff landet in den oberen Codebooks, also im Hochtondetail.
+        # Weil der Codec-Decoder nicht gedaechtnislos ist, laeuft das in die
+        # Frames hinein, die behalten werden: hoerbar als aufgesetzter hoher
+        # Ton am Segmentanfang, nur beim 8B (der 1.7B hat kein Delay).
+        #
+        # Fuer die r-te erzeugte Zeile gilt Zelle (r, c) = raw[T + r - c, c]
+        # fuer c >= r+1, also tail[r + n_vq - 1 - c, c]. Das sind 496 Zellen
+        # bei n_vq 32 -- 31 in der ersten Zeile, dann 30, 29, ... bis 1.
+        for i, data in enumerate(datas):
+            tail = getattr(data, "seam_tail", None)
+            if tail is None:
+                continue
+            step = int(getattr(data, "seam_step", 0))
+            if step >= n_vq - 1:
+                data.seam_tail = None
+                continue
+            if not bool(sampling_audio_mask[i].any()):
+                continue
+            chans = torch.arange(step + 1, n_vq, device=device)
+            tail_rows = (step + n_vq - 1) - chans
+            next_audio[i, chans] = tail.to(device)[tail_rows, chans]
+            data.seam_step = step + 1
+
         increment = (
             (next_text == audio_start)
             | (next_text == gen_slot)
