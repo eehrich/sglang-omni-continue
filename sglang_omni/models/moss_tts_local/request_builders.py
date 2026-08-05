@@ -163,6 +163,28 @@ def build_moss_tts_local_state(payload: StagePayload) -> MossTTSLocalState:
     )
 
 
+def resolve_moss_tts_local_voice_ref_codes(
+    payload: StagePayload,
+    *,
+    processor: Any,
+) -> torch.Tensor | None:
+    """Codes fuer den USER-Slot, getrennt vom Prefix im Assistant-Slot.
+
+    Nur gesetzt, wenn der Aufrufer ``voice_ref_codes`` mitschickt. Dann wandert
+    die Stimmidentitaet als Referenz in die User-Nachricht, waehrend
+    ``ref_codes`` weiterhin den Prefix bildet -- also das, was das Modell
+    tatsaechlich selbst erzeugt hat.
+
+    Der Sinn: heute liegt beides im Assistant-Slot, und der Anker ist eine
+    eingekaufte Aufnahme, deren Codes vom Encoder stammen statt vom Modell.
+    Dem Modell zu sagen "das hast du gesprochen" ist dort eine Behauptung.
+
+    Fehlt der Parameter, gibt es None und alles bleibt wie bisher.
+    """
+    return _resolve_codes_param(payload, processor=processor,
+                                key=VOICE_REF_CODES_PARAM)
+
+
 def resolve_moss_tts_local_ref_codes(
     payload: StagePayload,
     *,
@@ -181,6 +203,19 @@ def resolve_moss_tts_local_ref_codes(
     ``ref_audio`` when both are present (they are the same reference, already
     encoded).
     """
+    return _resolve_codes_param(payload, processor=processor, key=REF_CODES_PARAM)
+
+
+VOICE_REF_CODES_PARAM = "voice_ref_codes"
+
+
+def _resolve_codes_param(
+    payload: StagePayload,
+    *,
+    processor: Any,
+    key: str,
+) -> torch.Tensor | None:
+    """Gepackte Codes unter ``key`` lesen, dekodieren und pruefen."""
     inputs = payload.request.inputs or {}
     metadata = payload.request.metadata or {}
     tts_params = metadata.get("tts_params")
@@ -188,7 +223,7 @@ def resolve_moss_tts_local_ref_codes(
         tts_params = {}
     _, references = normalize_moss_tts_inputs(inputs)
     reference = references[0] if references else {}
-    raw = reference.get(REF_CODES_PARAM) or tts_params.get(REF_CODES_PARAM)
+    raw = reference.get(key) or tts_params.get(key)
     if raw is None:
         return None
     cfg = processor.model_config
@@ -343,6 +378,7 @@ def _build_continuation_conversation(
     state: MossTTSLocalState,
     *,
     prior_codes: torch.Tensor,
+    voice_ref_codes: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     """Build a [user(full text), assistant(prior audio)] continuation turn.
 
@@ -358,7 +394,11 @@ def _build_continuation_conversation(
     """
     user_message = processor.build_user_message(
         text=state.text,
-        reference=None,
+        # Normalerweise None: die Stimme kommt aus dem Prefix. Schickt der
+        # Aufrufer ``voice_ref_codes``, wandert die Stimmidentitaet stattdessen
+        # hierher in den USER-Slot, und im Assistant-Slot bleibt nur, was das
+        # Modell selbst erzeugt hat. Testmodus, strikt opt-in.
+        reference=[voice_ref_codes] if voice_ref_codes is not None else None,
         instruction=state.instructions,
         tokens=state.token_count,
         language=state.language,
@@ -398,7 +438,10 @@ def _prepare_moss_tts_local_request(
             processor, state, reference_encoder, ref_codes
         )
         conversation = _build_continuation_conversation(
-            processor, state, prior_codes=prefix_codes
+            processor, state, prior_codes=prefix_codes,
+            voice_ref_codes=resolve_moss_tts_local_voice_ref_codes(
+                payload, processor=processor
+            ),
         )
         batch = processor([conversation], mode="continuation")
     else:
