@@ -11,11 +11,25 @@ from sglang_omni.comm.data_ref import (
     TransportKind,
 )
 from sglang_omni.comm.engine import CommEngine
+from sglang_omni.comm.kv_transfer import (
+    KVBufferRegion,
+    KVPageDestination,
+    KVPageLease,
+    KVPageTransfer,
+    KVPool,
+    KVReceiver,
+)
 from sglang_omni.comm.router import CommRouter
 
 __all__ = [
     "BackendRef",
     "CommEngine",
+    "KVBufferRegion",
+    "KVPageDestination",
+    "KVPageLease",
+    "KVPageTransfer",
+    "KVPool",
+    "KVReceiver",
     "CommRouter",
     "MetadataTensorRef",
     "TensorMeta",

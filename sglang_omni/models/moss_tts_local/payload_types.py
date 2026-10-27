@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 from sglang_omni.scheduling.pipeline_state import DeclarativeStateBase, wire
+
+if TYPE_CHECKING:
+    import torch
+else:
+    pass
 
 
 def moss_tts_local_special_token_defaults(
@@ -38,13 +44,15 @@ class MossTTSLocalState(DeclarativeStateBase):
 
     sample_rate: int = wire(48000, codec="int_or")
     text: str = wire("", codec="str")
-    ref_audio: Any | None = None
+    ref_audio: object = None
     ref_text: str | None = None
     language: str | None = None
     instructions: str | None = None
     token_count: int | None = wire(None, codec="opt_int")
-    generation_kwargs: dict[str, Any] = wire(default_factory=dict, codec="dict")
-    audio_codes: Any | None = wire(None, codec="tensor_cpu")
+    generation_kwargs: Mapping[str, int | float] = wire(
+        default_factory=dict, codec="dict"
+    )
+    audio_codes: torch.Tensor | None = wire(None, codec="tensor_cpu")
     # Continuation only: the assistant-slot prefix, carried to the vocoder as
     # DECODER CONTEXT. The codec is not memoryless -- decoding the new frames
     # alone starts it cold, and measured against the transformers reference
@@ -53,4 +61,4 @@ class MossTTSLocalState(DeclarativeStateBase):
     # afterwards; this field is what lets the vocoder do the same.
     # NOT the returned codes: ``audio_codes`` stays the generated rows, because
     # a caller chaining segments feeds them into the next request's prefix.
-    audio_context_codes: Any | None = wire(None, codec="tensor_cpu")
+    audio_context_codes: torch.Tensor | None = wire(None, codec="tensor_cpu")

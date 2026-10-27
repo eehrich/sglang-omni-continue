@@ -1,0 +1,462 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import concurrent.futures
+import contextlib
+import queue
+import threading
+import time
+from collections.abc import Iterator
+from types import SimpleNamespace
+
+import pytest
+import torch
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+)
+
+from sglang_omni.models.whisper_asr.encoder_service import (
+    WhisperPreLMEncoderService,
+    expected_audio_tokens,
+)
+from sglang_omni.scheduling.pre_lm_encoder import QueueEntry, QueueSignal
+
+HIDDEN_SIZE = 8
+TOKENS = 4
+NAMESPACE = "whisper-test"
+SERVICES: list[WhisperPreLMEncoderService] = []
+
+
+@pytest.fixture(autouse=True)
+def close_services() -> Iterator[None]:
+    yield
+    for service in SERVICES:
+        service.close()
+    SERVICES.clear()
+
+
+class StubEncoder(torch.nn.Module):
+    def __init__(self, dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2).to(dtype)
+        self.encode_calls = 0
+        self.fail = False
+        self.fail_multi_item = False
+        self.encode_gate: threading.Event | None = None
+
+    def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
+        self.encode_calls += 1
+        gate = self.encode_gate
+        if gate is not None:
+            self.encode_gate = None
+            gate.wait(timeout=10)
+        if self.fail:
+            raise RuntimeError("boom")
+        if self.fail_multi_item and audio_features.shape[0] > 1:
+            raise RuntimeError("multi-item boom")
+        batch = audio_features.shape[0]
+        fill = float(audio_features.reshape(batch, -1)[:, 0].mean().item() + 1.0)
+        return torch.full(
+            (batch, TOKENS, HIDDEN_SIZE),
+            fill,
+            dtype=audio_features.dtype,
+            device=audio_features.device,
+        )
+
+
+class StubModel(torch.nn.Module):
+    def __init__(self, dtype: torch.dtype = torch.float32) -> None:
+        super().__init__()
+        encoder = StubEncoder(dtype=dtype)
+        self.model = SimpleNamespace(encoder=encoder)
+        self.config = SimpleNamespace(d_model=HIDDEN_SIZE)
+        self.encoder = encoder
+
+    @property
+    def encode_calls(self) -> int:
+        return self.encoder.encode_calls
+
+    def encode_audio_features(self, items: list[object]) -> torch.Tensor:
+        features: list[torch.Tensor] = []
+        reference = next(self.encoder.parameters())
+        for item in items:
+            feature = getattr(item, "feature", None)
+            if feature is None:
+                raise RuntimeError("missing mel features")
+            if not isinstance(feature, torch.Tensor):
+                feature = torch.as_tensor(feature)
+            features.append(feature.to(device=reference.device, dtype=reference.dtype))
+        return self.encoder(torch.cat(features, dim=0))
+
+
+def make_item(*, fingerprint: str = "fp", fill: float = 1.0) -> MultimodalDataItem:
+    return MultimodalDataItem(
+        modality=Modality.AUDIO,
+        feature=torch.full((1, 80, 16), fill),
+        model_specific_data={
+            "audio_fingerprint": fingerprint,
+            "num_audio_tokens": TOKENS,
+        },
+    )
+
+
+def make_service(
+    model: StubModel | None = None,
+    *,
+    cache_max_entries: int = 16,
+    cache_max_bytes: int | None = None,
+    max_batch_size: int = 8,
+    pin_host_memory: bool = True,
+) -> WhisperPreLMEncoderService:
+    service = WhisperPreLMEncoderService(
+        model or StubModel(),
+        cache_namespace=NAMESPACE,
+        encoder_token_count=TOKENS,
+        cache_max_entries=cache_max_entries,
+        cache_max_bytes=cache_max_bytes,
+        max_batch_size=max_batch_size,
+        pin_host_memory=pin_host_memory,
+    )
+    SERVICES.append(service)
+    return service
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="pinned host memory needs a CUDA context"
+)
+
+
+def cuda_model() -> StubModel:
+    return StubModel(dtype=torch.float16).to("cuda")
+
+
+def cached_entry(service: WhisperPreLMEncoderService, fingerprint: str) -> torch.Tensor:
+    cached = service.lookup_cached_embedding(fingerprint, TOKENS)
+    assert cached is not None
+    return cached
+
+
+def test_pinning_is_off_without_cuda_device() -> None:
+    # note (Jeffro): the stub model lives on CPU: there is nothing to DMA against, so the
+    # service must not try to page-lock anything.
+    service = make_service()
+    assert service.pin_host_memory is False
+    assert service.cache.pin_memory is False
+    assert service.stats()["pin_prewarm_s"] == 0.0
+
+
+@pytest.mark.accelerator
+@requires_cuda
+def test_cuda_cache_entries_are_pinned_and_match_device_result() -> None:
+    model = cuda_model()
+    service = make_service(model)
+    assert service.pin_host_memory is True
+    item = make_item(fingerprint="pinned", fill=2.0)
+    service.encode_item(item)
+    cached = cached_entry(service, "pinned")
+    assert cached.device.type == "cpu"
+    assert cached.is_pinned()
+    assert cached.dtype == torch.float16
+    torch.cuda.synchronize()
+    assert torch.equal(cached.to("cuda"), item.precomputed_embeddings)
+    # note (Jeffro): no fingerprint means nothing will be cached, so nothing is staged.
+    anonymous = make_item(fingerprint="ignored")
+    anonymous.audio_fingerprint = None
+    assert service.stage_host_copy(anonymous, item.precomputed_embeddings) is None
+
+
+@pytest.mark.accelerator
+@requires_cuda
+def test_cuda_hit_attaches_device_tensor_from_pinned_entry() -> None:
+    model = cuda_model()
+    service = make_service(model)
+    first = make_item(fingerprint="hit", fill=1.5)
+    second = make_item(fingerprint="hit", fill=7.0)
+    service.encode_item(first)
+    service.encode_item(second)
+    torch.cuda.synchronize()
+    assert model.encode_calls == 1
+    assert second.precomputed_embeddings.is_cuda
+    assert torch.equal(first.precomputed_embeddings, second.precomputed_embeddings)
+
+
+@pytest.mark.accelerator
+@requires_cuda
+def test_pin_host_memory_flag_disables_pinning() -> None:
+    service = make_service(cuda_model(), pin_host_memory=False)
+    assert service.pin_host_memory is False
+    item = make_item(fingerprint="pageable")
+    service.encode_item(item)
+    cached = cached_entry(service, "pageable")
+    assert not cached.is_pinned()
+    assert service.stats()["pin_prewarm_s"] == 0.0
+
+
+@pytest.mark.accelerator
+@requires_cuda
+def test_pinned_allocation_failure_falls_back_to_pageable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service(cuda_model())
+    assert service.pin_host_memory is True
+
+    def boom(tokens: int) -> torch.Tensor:
+        raise RuntimeError("cudaHostAlloc failed")
+
+    monkeypatch.setattr(service, "new_pinned_host", boom)
+    item = make_item(fingerprint="fallback", fill=4.0)
+    service.encode_item(item)
+    # note (Jeffro): the entry is still cached, just in pageable memory, and the service
+    # stops trying to pin so the failure is paid once, not per request.
+    cached = cached_entry(service, "fallback")
+    assert not cached.is_pinned()
+    assert service.pin_host_memory is False
+    assert service.cache.pin_memory is False
+    assert service.stats()["pin_failures"] == 1
+    torch.cuda.synchronize()
+    assert torch.equal(cached.to("cuda"), item.precomputed_embeddings)
+
+
+@pytest.mark.accelerator
+@requires_cuda
+def test_prewarm_covers_cache_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
+    allocations: list[int] = []
+    original = WhisperPreLMEncoderService.new_pinned_host
+
+    def counting(self: WhisperPreLMEncoderService, tokens: int) -> torch.Tensor:
+        allocations.append(tokens)
+        return original(self, tokens)
+
+    monkeypatch.setattr(WhisperPreLMEncoderService, "new_pinned_host", counting)
+    service = make_service(cuda_model(), cache_max_entries=5)
+    assert allocations == [TOKENS] * 5
+    assert service.stats()["pin_prewarm_s"] >= 0.0
+    # Zero capacity means nothing to warm.
+    allocations.clear()
+    make_service(cuda_model(), cache_max_entries=0)
+    assert allocations == []
+
+
+def test_cache_budget_is_derived_from_entry_count() -> None:
+    service = make_service(cache_max_entries=16)
+    entry_bytes = TOKENS * HIDDEN_SIZE * torch.float32.itemsize
+
+    assert service.entry_bytes == entry_bytes
+    assert service.cache_max_bytes == 16 * entry_bytes
+    assert service.cache_capacity_entries == 16
+    assert service.stats()["cache_capacity_entries"] == 16
+
+
+def test_cache_budget_respects_explicit_byte_cap() -> None:
+    entry_bytes = TOKENS * HIDDEN_SIZE * torch.float32.itemsize
+
+    capped = make_service(cache_max_entries=16, cache_max_bytes=3 * entry_bytes)
+    assert capped.cache_max_bytes == 3 * entry_bytes
+    assert capped.cache_capacity_entries == 3
+
+    # A cap above the derived budget never raises it.
+    loose = make_service(cache_max_entries=16, cache_max_bytes=100 * entry_bytes)
+    assert loose.cache_max_bytes == 16 * entry_bytes
+    assert loose.cache_capacity_entries == 16
+
+
+def test_cache_capacity_matches_lru_behavior() -> None:
+    # Two entries fit; a third insert must evict the least recently used one.
+    service = make_service(cache_max_entries=2)
+    for index in range(3):
+        service.encode_item(make_item(fingerprint=f"fp{index}", fill=float(index)))
+
+    stats = service.stats()
+    assert stats["cache_capacity_entries"] == 2
+    assert stats["cache_entries"] == 2
+    assert stats["cache_evictions"] == 1
+
+
+def test_zero_entries_disables_cache() -> None:
+    service = make_service(cache_max_entries=0)
+    assert service.cache_capacity_entries == 0
+    item = make_item(fingerprint="fp0")
+    service.encode_item(item)
+    assert item.precomputed_embeddings is not None
+    assert service.stats()["cache_entries"] == 0
+
+
+def test_expected_audio_tokens() -> None:
+    def item(num_audio_tokens: int | None) -> MultimodalDataItem:
+        return MultimodalDataItem(
+            modality=Modality.AUDIO,
+            model_specific_data={"num_audio_tokens": num_audio_tokens},
+        )
+
+    assert expected_audio_tokens(item(12)) == 12
+    assert expected_audio_tokens(item(None)) is None
+
+
+def test_encode_item_attaches_and_clears_feature() -> None:
+    service = make_service()
+    item = make_item(fill=3.0)
+    service.encode_item(item)
+    assert item.feature is None
+    assert item.precomputed_embeddings is not None
+    assert tuple(item.precomputed_embeddings.shape) == (TOKENS, HIDDEN_SIZE)
+    assert item.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+    assert service.stats()["misses"] == 1
+    assert service.stats()["batches"] == 1
+
+
+def test_encode_item_hits_cache_on_second_call() -> None:
+    model = StubModel()
+    service = make_service(model)
+    first = make_item(fingerprint="same", fill=2.0)
+    second = make_item(fingerprint="same", fill=9.0)
+    service.encode_item(first)
+    service.encode_item(second)
+    assert model.encode_calls == 1
+    assert service.stats()["hits"] == 1
+    assert torch.equal(first.precomputed_embeddings, second.precomputed_embeddings)
+
+
+def test_lookup_cached_embedding_skips_worker() -> None:
+    model = StubModel()
+    service = make_service(model)
+    item = make_item(fingerprint="lookup")
+    service.encode_item(item)
+    cached = service.lookup_cached_embedding("lookup", TOKENS)
+    assert cached is not None
+    assert model.encode_calls == 1
+    assert service.stats()["hits"] >= 1
+
+
+def test_no_fingerprint_does_not_cache() -> None:
+    model = StubModel()
+    service = make_service(model)
+    item = make_item(fingerprint="ignored")
+    item.audio_fingerprint = None
+    service.encode_item(item)
+    assert item.precomputed_embeddings is not None
+    assert service.stats()["misses"] == 0
+    assert service.stats()["hits"] == 0
+    assert len(service.cache) == 0
+
+
+def test_close_rejects_new_encodes() -> None:
+    service = make_service()
+    service.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        service.encode_item(make_item())
+
+
+def test_batched_encode_retries_per_item_on_multi_failure() -> None:
+    model = StubModel()
+    model.encoder.fail_multi_item = True
+    gate = threading.Event()
+    model.encoder.encode_gate = gate
+    service = make_service(model, max_batch_size=4)
+    items = [make_item(fingerprint=f"b{i}", fill=float(i + 1)) for i in range(3)]
+    errors: list[Exception] = []
+
+    def worker(item: MultimodalDataItem) -> None:
+        try:
+            service.encode_item(item)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(item,)) for item in items]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 5
+    while len(service.inflight) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(service.inflight) == 3
+    gate.set()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    assert all(item.precomputed_embeddings is not None for item in items)
+    assert model.encode_calls == 4
+
+
+@pytest.mark.parametrize("fail_multi_item", [False, True])
+def test_pipelined_worker_delivers_completed_outputs_and_preserves_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    fail_multi_item: bool,
+) -> None:
+    """Launching a later batch must not publish or cache unfinished encoder states."""
+    model = StubModel()
+    service = make_service(model, max_batch_size=2 if fail_multi_item else 1)
+    service.close()
+    service.queue = queue.Queue()
+    service.pipeline_batches = True
+    model.encoder.fail_multi_item = fail_multi_item
+    order: list[str] = []
+
+    class Stream:
+        def synchronize(self) -> None:
+            order.append("stream-sync")
+
+    class Completion:
+        def __init__(self) -> None:
+            self.index = sum(value.startswith("record") for value in order)
+
+        def record(self, stream: Stream) -> None:
+            assert stream is service.stream
+            order.append(f"record-{self.index}")
+
+        def synchronize(self) -> None:
+            order.append(f"sync-{self.index}")
+
+    service.stream = Stream()
+    monkeypatch.setattr(service, "batch_context", contextlib.nullcontext)
+    monkeypatch.setattr(torch.cuda, "Event", Completion)
+    entries = [
+        QueueEntry(
+            item=make_item(fingerprint=f"pipeline-{i}", fill=float(i)),
+            future=concurrent.futures.Future(),
+        )
+        for i in range(2)
+    ]
+    for entry in entries:
+        service.queue.put(entry)
+    service.queue.put(QueueSignal.SHUTDOWN)
+    service.worker()
+    for i, entry in enumerate(entries):
+        actual = entry.future.result(timeout=1)
+        torch.testing.assert_close(
+            actual, torch.full((TOKENS, HIDDEN_SIZE), float(i + 1))
+        )
+        torch.testing.assert_close(cached_entry(service, f"pipeline-{i}"), actual)
+    if fail_multi_item:
+        assert model.encode_calls == 3
+    else:
+        assert order.index("record-1") < order.index("sync-0") < order.index("sync-1")
+    assert service.worker_error is None
+
+
+@pytest.mark.accelerator
+@requires_cuda
+def test_pipelined_cuda_encoder_retains_outputs_and_host_cache() -> None:
+    """Real stream completion must fence request results and asynchronous cache copies."""
+    service = WhisperPreLMEncoderService(
+        cuda_model(),
+        cache_namespace=NAMESPACE,
+        encoder_token_count=TOKENS,
+        max_batch_size=1,
+        pipeline_batches=True,
+    )
+    SERVICES.append(service)
+    items = [
+        make_item(fingerprint=f"cuda-pipeline-{i}", fill=float(i)) for i in range(4)
+    ]
+    futures = [service.submit(item) for item in items]
+    for i, future in enumerate(futures):
+        actual = future.result(timeout=30)
+        expected = torch.full_like(actual, float(i + 1))
+        assert actual.is_cuda
+        torch.testing.assert_close(actual, expected)
+        cached = cached_entry(service, f"cuda-pipeline-{i}")
+        assert cached.device.type == "cpu"
+        torch.testing.assert_close(cached, expected.cpu())

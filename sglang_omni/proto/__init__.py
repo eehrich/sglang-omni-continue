@@ -14,6 +14,12 @@ from .admin import (
     AdminResult,
     is_update_action,
 )
+from .kv_transfer import (
+    KVBufferSpec,
+    KVPoolLayout,
+    KVTransferPrepareMessage,
+    KVTransferReadyMessage,
+)
 from .messages import (
     AbortMessage,
     AdminMessage,
@@ -21,6 +27,7 @@ from .messages import (
     CompleteMessage,
     DataAckMessage,
     DataReadyMessage,
+    FreezeGCMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -29,7 +36,7 @@ from .messages import (
     parse_message,
 )
 from .request import (
-    EXPLICIT_GENERATION_PARAMS_KEY,
+    MOSS_CONTINUATION_PARAM,
     MOSS_GENERATED_CODES_FIELD,
     MOSS_RETURN_CODES_PARAM,
     OmniRequest,
@@ -57,17 +64,22 @@ __all__ = [
     "is_update_action",
     "DataAckMessage",
     "DataReadyMessage",
+    "KVBufferSpec",
+    "KVPoolLayout",
+    "KVTransferPrepareMessage",
+    "KVTransferReadyMessage",
     "AbortMessage",
     "CompleteMessage",
     "StreamMessage",
     "SubmitMessage",
     "ShutdownMessage",
+    "FreezeGCMessage",
     "ProfilerStartMessage",
     "ProfilerStopMessage",
     "parse_message",
     "RequestState",
     "RequestInfo",
-    "EXPLICIT_GENERATION_PARAMS_KEY",
+    "MOSS_CONTINUATION_PARAM",
     "MOSS_GENERATED_CODES_FIELD",
     "MOSS_RETURN_CODES_PARAM",
     "OmniRequest",

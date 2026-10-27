@@ -3,15 +3,22 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.model_runner.prefill_inputs import (
+    OmniPrefillInputs,
+    attach_omni_prefill_inputs,
+    get_omni_prefill_inputs,
+)
+from tests.unit_test.fakes import FakeExecutionBridge
 
 
-def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
+def install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in [
         "sglang",
         "sglang.srt",
@@ -26,11 +33,20 @@ def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class ForwardBatch:
         @staticmethod
-        def init_new(model_worker_batch, model_runner):
-            del model_runner
+        def init_new(
+            model_worker_batch,
+            model_runner,
+            *,
+            capture_hidden_mode=None,
+            return_hidden_states_before_norm,
+        ):
+            # Mirrors the upstream signature: both overrides are
+            # keyword-only and return_hidden_states_before_norm is required.
+            del model_runner, return_hidden_states_before_norm
             return SimpleNamespace(
                 input_ids=torch.tensor([1]),
                 marker=model_worker_batch.marker,
+                capture_hidden_mode=capture_hidden_mode,
             )
 
     forward_batch_info = types.ModuleType(
@@ -45,28 +61,30 @@ def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-class _ForwardMode:
+class ForwardMode:
     def __init__(self, *, is_prefill: bool) -> None:
-        self._is_prefill = is_prefill
+        self.is_prefill = is_prefill
 
     def is_extend(self) -> bool:
-        return self._is_prefill
+        return self.is_prefill
 
 
-def _scheduler_output(*, is_prefill: bool):
-    model_worker_batch = SimpleNamespace(marker="worker-batch")
+def make_scheduler_output(*, is_prefill: bool):
     schedule_batch = SimpleNamespace(
-        forward_mode=_ForwardMode(is_prefill=is_prefill),
+        forward_mode=ForwardMode(is_prefill=is_prefill),
         is_prefill_only=False,
         output_ids=None,
-        get_model_worker_batch=lambda: model_worker_batch,
+        marker="worker-batch",
+        sampling_info=SimpleNamespace(penalizer_orchestrator=None),
+        prefill_input_ids_cpu=None,
+        mix_running_indices=None,
     )
     request_data = SimpleNamespace(generation_steps=0, extra_model_outputs={})
     request = SimpleNamespace(request_id="req-1", data=request_data)
     return SimpleNamespace(batch_data=schedule_batch, requests=[request])
 
 
-def _runner(calls: list[str], *, custom_result):
+def make_runner(calls: list[str], *, custom_result):
     class RecordingRunner(ModelRunner):
         def before_prefill(self, forward_batch, schedule_batch, requests):
             del forward_batch, schedule_batch, requests
@@ -103,8 +121,9 @@ def _runner(calls: list[str], *, custom_result):
 
     runner = object.__new__(RecordingRunner)
     runner.device = torch.device("cpu")
+    runner.execution_bridge = FakeExecutionBridge()
     runner.output_processor = SimpleNamespace(
-        _capture_hidden=False,
+        capture_hidden=False,
         process=lambda result, scheduler_output: {
             "req-1": SimpleNamespace(extra={}),
         },
@@ -126,6 +145,22 @@ def _runner(calls: list[str], *, custom_result):
     return runner
 
 
+def test_resolve_deferred_prefill_inputs_materializes_staged_ids():
+    from sglang_omni.model_runner.base import resolve_deferred_prefill_inputs
+
+    staged = torch.tensor([11, 12], dtype=torch.long)
+    batch = SimpleNamespace(
+        input_ids=None,
+        prefill_input_ids_cpu=staged,
+        mix_running_indices=None,
+    )
+
+    resolve_deferred_prefill_inputs(batch, torch.device("cpu"))
+
+    assert batch.prefill_input_ids_cpu is None
+    assert torch.equal(batch.input_ids, staged)
+
+
 @pytest.mark.parametrize(
     ("is_prefill", "expected"),
     [
@@ -138,7 +173,7 @@ def test_execute_uses_explicit_custom_forward_hook(
     is_prefill: bool,
     expected: list[str],
 ) -> None:
-    _install_fake_forward_batch_module(monkeypatch)
+    install_fake_forward_batch_module(monkeypatch)
     calls: list[str] = []
     custom_result = SimpleNamespace(
         logits_output=None,
@@ -146,22 +181,88 @@ def test_execute_uses_explicit_custom_forward_hook(
         can_run_cuda_graph=True,
     )
 
-    output = _runner(calls, custom_result=custom_result).execute(
-        _scheduler_output(is_prefill=is_prefill)
+    output = make_runner(calls, custom_result=custom_result).execute(
+        make_scheduler_output(is_prefill=is_prefill)
     )
 
     assert calls == expected
     assert output.can_run_cuda_graph is True
 
 
+def test_execute_pins_the_runners_own_device_not_the_platforms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing this through current_platform broke cpu-resident runners: an
+    accelerator's set_device rejects a cpu device, so a CUDA host raised
+    'Expected a cuda device, but got: cpu' while an XPU host silently accepted it.
+    """
+    import sglang_omni.platforms as platforms
+
+    def reject(device):
+        raise AssertionError(f"platform set_device called with {device!r}")
+
+    monkeypatch.setattr(platforms.current_platform, "set_device", reject, raising=False)
+    install_fake_forward_batch_module(monkeypatch)
+    calls: list[str] = []
+
+    make_runner(calls, custom_result=None).execute(
+        make_scheduler_output(is_prefill=True)
+    )
+
+    assert calls[0] == "before_prefill"
+
+
+def test_execute_never_reaches_for_a_device_module_on_a_cpu_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cpu runner has no per-device context to bind, so it must not touch a device
+    module at all. torch.cpu.set_device is only incidentally a tolerant no-op, so
+    calling it would leave cpu-resident runners at the mercy of that detail.
+    """
+
+    install_fake_forward_batch_module(monkeypatch)
+    calls: list[str] = []
+    runner = make_runner(calls, custom_result=None)
+
+    def reject(device):
+        raise AssertionError(f"get_device_module called with {device!r}")
+
+    monkeypatch.setattr(torch, "get_device_module", reject)
+    runner.execute(make_scheduler_output(is_prefill=True))
+
+    assert calls[0] == "before_prefill"
+
+
+def test_execute_still_binds_the_index_of_an_accelerator_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipping cpu must not skip accelerators: the runner still binds its own card,
+    by index, since torch.xpu.set_device rejects a device object.
+    """
+    bound: list[object] = []
+    install_fake_forward_batch_module(monkeypatch)
+    calls: list[str] = []
+
+    runner = make_runner(calls, custom_result=None)
+    runner.device = torch.device("xpu", 1)
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(set_device=bound.append),
+    )
+    runner.execute(make_scheduler_output(is_prefill=True))
+
+    assert bound == [1]
+
+
 def test_execute_falls_back_to_standard_forward_after_before_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_fake_forward_batch_module(monkeypatch)
+    install_fake_forward_batch_module(monkeypatch)
     calls: list[str] = []
 
-    output = _runner(calls, custom_result=None).execute(
-        _scheduler_output(is_prefill=True)
+    output = make_runner(calls, custom_result=None).execute(
+        make_scheduler_output(is_prefill=True)
     )
 
     assert calls == [
@@ -172,6 +273,141 @@ def test_execute_falls_back_to_standard_forward_after_before_hook(
     ]
     assert output.can_run_cuda_graph is False
     assert not hasattr(ModelRunner, "prepare_prefill")
+
+
+def prefill_forward_batch() -> SimpleNamespace:
+    return SimpleNamespace(
+        input_embeds=None,
+        replace_embeds=None,
+        mm_inputs=[None],
+        input_ids=torch.tensor([1]),
+        batch_size=1,
+    )
+
+
+def test_prepare_and_forward_clears_sidecar_before_cleanup_on_forward_error() -> None:
+    runner = object.__new__(ModelRunner)
+    forward_batch = prefill_forward_batch()
+    payload = OmniPrefillInputs(input_embeds=torch.zeros(1, 4))
+    cleanup_observations: list[object] = []
+
+    runner.before_prefill = lambda *args: attach_omni_prefill_inputs(
+        forward_batch, payload
+    )
+
+    def fail_forward(*args):
+        raise ValueError("forward failed")
+
+    runner.custom_prefill_forward = fail_forward
+    runner.cleanup_prefill = lambda *args: cleanup_observations.append(
+        get_omni_prefill_inputs(forward_batch)
+    )
+
+    with pytest.raises(ValueError, match="forward failed"):
+        runner.prepare_and_forward(
+            forward_batch,
+            SimpleNamespace(is_prefill_only=True),
+            [],
+            True,
+        )
+
+    assert cleanup_observations == [None]
+    assert get_omni_prefill_inputs(forward_batch) is None
+
+
+@pytest.mark.parametrize("retain_prefill_input_embeds", [True, False])
+def test_prepare_and_forward_keeps_the_composed_embeds_only_for_a_draft_that_reads_them(
+    retain_prefill_input_embeds: bool,
+) -> None:
+    """The sidecar is cleared at cleanup, so an EAGLE draft gets its own reference."""
+    runner = object.__new__(ModelRunner)
+    runner.retain_prefill_input_embeds = retain_prefill_input_embeds
+    forward_batch = prefill_forward_batch()
+    payload = OmniPrefillInputs(input_embeds=torch.zeros(1, 4))
+    runner.before_prefill = lambda *args: attach_omni_prefill_inputs(
+        forward_batch, payload
+    )
+    runner.custom_prefill_forward = lambda *args: SimpleNamespace(
+        logits_output=None, next_token_ids=torch.tensor([5])
+    )
+    runner.cleanup_prefill = lambda *args: None
+
+    runner.prepare_and_forward(
+        forward_batch,
+        SimpleNamespace(is_prefill_only=True),
+        [],
+        True,
+    )
+
+    assert get_omni_prefill_inputs(forward_batch) is None
+    assert runner.retained_prefill_input_embeds is (
+        payload.input_embeds if retain_prefill_input_embeds else None
+    )
+
+
+@pytest.mark.parametrize("runner_retains_itself", [False, True])
+def test_a_failed_prefill_keeps_no_composed_embeds(runner_retains_itself: bool) -> None:
+    """The target adapter releases the retained embeddings only from a returned
+    result, so a failed prefill keeps none, from the sidecar or set by the runner."""
+    runner = object.__new__(ModelRunner)
+    runner.retain_prefill_input_embeds = True
+    forward_batch = prefill_forward_batch()
+    payload = OmniPrefillInputs(input_embeds=torch.zeros(1, 4))
+    runner.before_prefill = lambda *args: attach_omni_prefill_inputs(
+        forward_batch, payload
+    )
+
+    def fail_forward(*args):
+        if runner_retains_itself:
+            runner.retained_prefill_input_embeds = payload.input_embeds
+        else:
+            pass
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    runner.custom_prefill_forward = fail_forward
+    runner.cleanup_prefill = lambda *args: None
+
+    with pytest.raises(torch.OutOfMemoryError):
+        runner.prepare_and_forward(
+            forward_batch,
+            SimpleNamespace(is_prefill_only=True),
+            [],
+            True,
+        )
+
+    assert runner.retained_prefill_input_embeds is None
+    assert get_omni_prefill_inputs(forward_batch) is None
+
+
+def test_execute_isolates_scheduler_sampling_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_forward_batch_module(monkeypatch)
+    isolate_sampling_values = []
+
+    @contextmanager
+    def forward_context(batch, *, isolate_sampling=False):
+        isolate_sampling_values.append(isolate_sampling)
+        yield
+
+    runner = make_runner(
+        [],
+        custom_result=SimpleNamespace(
+            logits_output=None,
+            next_token_ids=torch.tensor([7]),
+            can_run_cuda_graph=True,
+        ),
+    )
+    runner.bind_execution_bridge(
+        SimpleNamespace(
+            forward_context=forward_context,
+            publish_next_tokens=lambda *args: None,
+        )
+    )
+
+    runner.execute(make_scheduler_output(is_prefill=False))
+
+    assert isolate_sampling_values == [True]
 
 
 def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
@@ -199,15 +435,14 @@ def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
         ),
     ]
 
-    runner._finalize(
+    runner.finalize(
         SimpleNamespace(
             next_token_ids=torch.tensor([1, 2]),
             logits_output=None,
             can_run_cuda_graph=False,
         ),
         SimpleNamespace(),
-        SimpleNamespace(is_prefill_only=False, output_ids=None),
-        SimpleNamespace(seq_lens=[1, 1], input_ids=torch.zeros(2, dtype=torch.long)),
+        SimpleNamespace(is_prefill_only=False),
         SimpleNamespace(requests=requests),
     )
 

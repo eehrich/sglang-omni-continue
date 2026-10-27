@@ -35,27 +35,41 @@ echo "Preparing fresh ${HOST} (full rebuild)"
 rm -f "${OMNI_CI_HOME}/.omni-env-complete"
 rm -rf "${OMNI_CI_HOME}"
 mkdir -p "${OMNI_CI_HOME}"
-uv venv "${HOST}" -p 3.11
+# The image installs Python with uv; /usr/bin/python3 is a wrapper for this interpreter.
+uv venv --system-site-packages "${HOST}" -p /opt/sglang/bin/python3
+# Process the image's .pth files too: SGLang is installed editable upstream.
+echo 'import site; site.addsitedir("/opt/sglang/lib/python3.12/site-packages")' > "${HOST}/lib/python3.12/site-packages/sglang-image.pth"
 
 rm -rf "./${VENV_NAME}"
 ln -sfn "${HOST}" "./${VENV_NAME}"
 source "${VENV_NAME}/bin/activate"
-uv pip install -e .
 
-if ! python -c "import av" 2>/dev/null; then
-  echo "PyAV native libraries corrupted in prepared venv, force-reinstalling..."
-  uv pip install --force-reinstall --no-deps --no-cache av
+mapfile -t MISSING_REQUIREMENTS < <(
+  python "${SCRIPT_DIR}/omni_missing_dependencies.py" --extra minicpm-o --extra fun-cosyvoice3 pyproject.toml
+)
+if [ "${#MISSING_REQUIREMENTS[@]}" -gt 0 ]; then
+  echo "Installing dependencies missing from the image:"
+  printf '  %s\n' "${MISSING_REQUIREMENTS[@]}"
+  for requirement in "${MISSING_REQUIREMENTS[@]}"; do
+    python -m pip install "${requirement}"
+  done
 fi
+mapfile -t OVERRIDE_REQUIREMENTS < <(
+  python "${SCRIPT_DIR}/omni_missing_dependencies.py" --overrides pyproject.toml
+)
+if [ "${#OVERRIDE_REQUIREMENTS[@]}" -gt 0 ]; then
+  python -m pip install --no-deps "${OVERRIDE_REQUIREMENTS[@]}"
+fi
+uv pip install --no-deps -e .
 
-if ! python -c "from whisper.normalizers import EnglishTextNormalizer" 2>/dev/null; then
-  echo "openai-whisper missing from prepared venv, installing pinned dependency..."
-  uv pip install --force-reinstall --no-deps --no-cache openai-whisper==20250625
-fi
-
-if ! python -c "import zhon.hanzi" 2>/dev/null; then
-  echo "zhon missing from prepared venv, installing pinned dependency..."
-  uv pip install --force-reinstall --no-deps --no-cache zhon==2.1.1
-fi
+COSYVOICE_COMMIT=074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc
+COSYVOICE_PATH="${HOST}/src/CosyVoice"
+git clone --filter=blob:none --no-checkout https://github.com/FunAudioLLM/CosyVoice.git "${COSYVOICE_PATH}"
+git -C "${COSYVOICE_PATH}" checkout --detach "${COSYVOICE_COMMIT}"
+git -C "${COSYVOICE_PATH}" submodule update --init --depth=1 third_party/Matcha-TTS
+# Note (Jiannan Li): TTS jobs replace PYTHONPATH, so persist both source paths in the venv.
+printf '%s\n' "${COSYVOICE_PATH}" "${COSYVOICE_PATH}/third_party/Matcha-TTS" \
+  > "${HOST}/lib/python3.12/site-packages/cosyvoice.pth"
 
 if ! bash "${SCRIPT_DIR}/validate_omni_venv_imports.sh" "${VENV_NAME}"; then
   exit 1

@@ -97,7 +97,14 @@ shared helpers do the heavy lifting:
 - `create_sglang_infrastructure(server_args, gpu_id, *, model_arch_override=...)`
   from `sglang_omni.scheduling.bootstrap`, which returns the
   `(model_worker, tree_cache, req_to_token_pool, token_to_kv_pool_allocator,
-  prefill_mgr, decode_mgr, model_config)` tuple that `OmniScheduler` expects
+  model_config)` tuple that `OmniScheduler` expects
+
+Every GPU stage factory you write — the engine as well as encoders and
+vocoders — declares `device: str | None = None, gpu_id: int | None = None`
+and resolves them with `sglang_omni.utils.device.resolve_concrete_device`;
+never hard-code `"cuda"` or read `gpu_id` on its own. The contract and the
+sweep test that enforces it are described under "Device and GPU placement
+contract" in [config.md](config.md).
 
 Two pieces of glue still have to be added by hand:
 
@@ -118,13 +125,11 @@ request builder turns it into whatever the AR scheduler needs.
 
 Two things are easy to get wrong at this boundary:
 
-- **Endpoint defaults silently override model defaults.** The HTTP layer fills
-  in a single set of sampling defaults (currently the S2-Pro values). For any
-  other model, those values look exactly like the user explicitly asking for
-  them. Pass an `explicit_generation_params` list (or equivalent) through the
-  request and have your request builder distinguish "user set this" from "the
-  endpoint filled it in". The same trick is needed for any field where the
-  endpoint has an opinion.
+- **Model defaults belong in the request builder.** The HTTP layer passes only
+  the sampling fields the caller set, so a field missing from the request
+  params is one the caller left unset. Read each field with your model's
+  default, for example `params.get("temperature", 0.7)`, and treat a present
+  value as the caller's choice.
 - **Input is heterogeneous.** TTS clients send text under several names
   (`input`, `text`, sometimes a chat-style structure) and references under
   several shapes (`ref_audio` + `ref_text`, or a `references[]` list).
@@ -153,7 +158,7 @@ Pick by responsibility:
 
 - `SimpleScheduler` - a single callable, optionally batched via
   `batch_compute_fn`. Right for preprocessing and most vocoders.
-- `OmniScheduler` - wraps SGLang's prefill/decode managers, KV cache, and
+- `OmniScheduler` - wraps SGLang's scheduler methods, KV cache, and
   request-limit machinery. Use it for AR generation.
 - A custom scheduler - when neither of the above fits (stateful streaming
   vocoder, custom detokenizer, etc.).

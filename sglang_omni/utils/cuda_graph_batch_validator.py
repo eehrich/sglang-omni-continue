@@ -6,61 +6,76 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING
+
+import torch
+from sglang.srt.runtime_context import get_exec, get_schedule
+
+from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_max_bs
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+else:
+    pass
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class _BufferProbe:
+class BufferProbe:
     """Per-model ``(label, fn)`` extractors reading the allocated buffer first dim."""
 
-    extractors: tuple[tuple[str, Callable[[Any], int]], ...]
+    extractors: tuple[tuple[str, Callable[[torch.nn.Module], int]], ...]
     note: str = ""
 
 
-_BUFFER_PROBES: dict[str, _BufferProbe] = {
-    "HiggsTTSModel": _BufferProbe(
+_BUFFER_PROBES: dict[str, BufferProbe] = {
+    "HiggsTTSModel": BufferProbe(
         (
-            ("_sampler_pool.seeds", lambda m: m._sampler_pool.seeds.shape[0]),
-            ("_cg_codes_BN", lambda m: m._cg_codes_BN.shape[0]),
-            ("_cg_active_last_codes", lambda m: m._cg_active_last_codes.shape[0]),
+            ("sampler_pool.seeds", lambda m: m.sampler_pool.seeds.shape[0]),
+            ("cg_codes_BN", lambda m: m.cg_codes_BN.shape[0]),
+            ("cg_active_last_codes", lambda m: m.cg_active_last_codes.shape[0]),
         ),
         note="sampler pool = max_running_requests + 1 (one reserved padding row)",
     ),
-    "Qwen3TTSTalker": _BufferProbe(
-        (("_feedback_buffer", lambda m: m._feedback_buffer.shape[0]),)
-    ),
-    "MossTTSDelaySGLangModel": _BufferProbe(
+    "Qwen3TTSTalker": BufferProbe(
         (
             (
-                "_decode_input_embedding.weight",
-                lambda m: m._decode_input_embedding.weight.shape[0],
+                "decode_feedback_embedding.weight",
+                lambda m: m.decode_feedback_embedding.weight.shape[0],
             ),
         )
     ),
-    "MossTTSLocalSGLangModel": _BufferProbe(
+    "MossTTSDelaySGLangModel": BufferProbe(
         (
             (
-                "_decode_input_embedding.weight",
-                lambda m: m._decode_input_embedding.weight.shape[0],
+                "decode_input_embedding.weight",
+                lambda m: m.decode_input_embedding.weight.shape[0],
             ),
         )
     ),
-    "S2ProSGLangTextModel": _BufferProbe(
-        (("_vq_codes", lambda m: m._vq_codes.shape[0]),),
+    "MossTTSLocalSGLangModel": BufferProbe(
+        (
+            (
+                "decode_input_embedding.weight",
+                lambda m: m.decode_input_embedding.weight.shape[0],
+            ),
+        )
+    ),
+    "S2ProSGLangTextModel": BufferProbe(
+        (("vq_codes", lambda m: m.vq_codes.shape[0]),),
         note="allocated only after setup_vq_decode()",
     ),
-    "VoxtralSGLangTTSModel": _BufferProbe(
+    "VoxtralSGLangTTSModel": BufferProbe(
         (
             (
-                "_decode_input_embed_buffer",
-                lambda m: m._decode_input_embed_buffer.shape[0],
+                "decode_input_embed_buffer",
+                lambda m: m.decode_input_embed_buffer.shape[0],
             ),
         )
     ),
-    "Qwen3OmniTalker": _BufferProbe(
-        (("_feedback_buffer", lambda m: m._feedback_buffer.shape[0]),)
+    "Qwen3OmniTalker": BufferProbe(
+        (("feedback_buffer", lambda m: m.feedback_buffer.shape[0]),)
     ),
 }
 
@@ -144,11 +159,15 @@ def evaluate_cuda_graph_batch_sizing(
                 f"buffer holds {buffer_capacity}; capture/replay above "
                 f"{buffer_capacity} overruns the model buffer."
             )
+        else:
+            pass
     elif buffer_capacity is None:
         findings.append(
             f"model-side buffer not read ({buffer_source}); validated serving "
             f"config vs. captured sizes only."
         )
+    else:
+        pass
 
     if expected_capture_target is not None:
         if max_captured is None:
@@ -165,6 +184,10 @@ def evaluate_cuda_graph_batch_sizing(
                 f"effective serving target {expected_capture_target}; replay at "
                 "larger runnable batch sizes will fall back or fail."
             )
+        else:
+            pass
+    else:
+        pass
 
     if (
         buffer_capacity is not None
@@ -177,11 +200,15 @@ def evaluate_cuda_graph_batch_sizing(
             f"max_running_requests ({max_running_requests}); peak concurrency "
             f"cannot be served."
         )
+    else:
+        pass
 
     if is_valid and not findings:
         findings.append(
             "captured sizes and model-side buffer track the serving config."
         )
+    else:
+        pass
 
     return CudaGraphBatchReport(
         stage=stage,
@@ -199,11 +226,12 @@ def evaluate_cuda_graph_batch_sizing(
 def read_captured_bs(model_runner: object) -> list[int] | None:
     """Read the actually-captured CUDA graph batch sizes, or None if absent."""
     try:
-        captured = model_runner.graph_runner.capture_bs
+        captured = model_runner.decode_cuda_graph_runner.capture_bs
     except AttributeError:
         logger.debug(
-            "cuda_graph_batch_validator: model_runner.graph_runner.capture_bs "
-            "missing (CUDA graphs disabled)."
+            "cuda_graph_batch_validator: "
+            "model_runner.decode_cuda_graph_runner.capture_bs missing "
+            "(decode CUDA graphs disabled)."
         )
         return None
     try:
@@ -224,11 +252,15 @@ def read_model_buffer_capacity(model: object) -> tuple[int | None, str]:
     """
     if model is None:
         return None, "no model object on runner"
+    else:
+        pass
 
     cls = type(model).__name__
     probe = _BUFFER_PROBES.get(cls)
     if probe is None:
         return None, f"no buffer probe registered for model class {cls!r}"
+    else:
+        pass
 
     candidates = [("model", model)]
     try:
@@ -237,6 +269,8 @@ def read_model_buffer_capacity(model: object) -> tuple[int | None, str]:
         inner = None
     if inner is not None and inner is not model:
         candidates.append(("model.model", inner))
+    else:
+        pass
 
     smallest: int | None = None
     source = ""
@@ -249,6 +283,8 @@ def read_model_buffer_capacity(model: object) -> tuple[int | None, str]:
             if smallest is None or dim < smallest:
                 smallest = dim
                 source = f"{where}.{label}.shape[0]"
+            else:
+                pass
 
     if smallest is None:
         labels = ", ".join(label for label, _ in probe.extractors)
@@ -256,10 +292,79 @@ def read_model_buffer_capacity(model: object) -> tuple[int | None, str]:
             f"model class {cls!r} registered but none of its buffers resolved "
             f"({labels}); buffer may not be allocated yet"
         )
+    else:
+        pass
 
     if probe.note:
         source += f" ({probe.note})"
+    else:
+        pass
     return smallest, source
+
+
+def attest_prefill_cuda_graphs(
+    model_runner: ModelRunner, *, operator_selected: bool
+) -> None:
+    """Assert captured prefill graphs match an explicit or realized policy.
+
+    An operator-selected backend must materialize or fail startup. A model
+    default keeps SGLang's auto-selection semantics and may fall back to eager
+    at capture-time safety gates such as insufficient free memory.
+    """
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
+    )
+
+    prefill_cfg = get_exec().graph.cuda_graph_config.prefill
+    # init_cuda_graphs always assigns this before attestation runs.
+    runner = model_runner.prefill_cuda_graph_runner
+    if not isinstance(runner, PrefillCudaGraphRunner):
+        if not operator_selected:
+            logger.warning(
+                "auto-selected prefill CUDA graph backend %r did not capture; "
+                "using SGLang's eager prefill fallback",
+                prefill_cfg.backend,
+            )
+            return
+        else:
+            pass
+        raise RuntimeError(
+            f"prefill CUDA graph backend {prefill_cfg.backend!r} was declared "
+            "but SGLang did not construct PrefillCudaGraphRunner "
+            f"(got {type(runner).__name__}); an eligibility gate disabled "
+            "prefill graphs during capture"
+        )
+    else:
+        pass
+    if runner.prefill_backend_name != prefill_cfg.backend:
+        raise RuntimeError(
+            "prefill CUDA graph backend mismatch: declared "
+            f"{prefill_cfg.backend!r}, captured {runner.prefill_backend_name!r}"
+        )
+    else:
+        pass
+    expected_buckets = sorted(int(b) for b in prefill_cfg.bs)
+    if list(runner.capture_num_tokens) != expected_buckets:
+        raise RuntimeError(
+            "prefill CUDA graph capture shapes differ from the declared "
+            f"policy: declared={expected_buckets}, "
+            f"captured={list(runner.capture_num_tokens)}"
+        )
+    else:
+        pass
+    if not runner.buffer_registry.has_slot("input_embeds"):
+        raise RuntimeError(
+            "prefill CUDA graph runner has no input_embeds slot; "
+            "enable_prefill_input_embeds did not reach the model config "
+            "before SGLang ModelRunner construction"
+        )
+    else:
+        pass
+    logger.info(
+        "prefill CUDA graphs attested: backend=%s buckets=%s",
+        runner.prefill_backend_name,
+        expected_buckets,
+    )
 
 
 def validate_stage(
@@ -269,14 +374,8 @@ def validate_stage(
     buffer_capacity: int | None = None,
 ) -> CudaGraphBatchReport:
     """Validate one SGLang-backed stage's batch sizing from its live runner."""
-    try:
-        server_args = model_runner.server_args
-        max_running_requests = server_args.max_running_requests
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs
-    except AttributeError:
-        server_args = None
-        max_running_requests = None
-        cuda_graph_max_bs = None
+    max_running_requests = get_schedule().max_running_requests
+    cuda_graph_max_bs = get_decode_cuda_graph_max_bs(model_runner.server_args)
 
     try:
         model = model_runner.model
@@ -284,7 +383,7 @@ def validate_stage(
         model = None
     model_cls = type(model).__name__ if model is not None else "unknown-model"
 
-    if bool(server_args.disable_cuda_graph):
+    if bool(get_exec().graph.disable_cuda_graph):
         return CudaGraphBatchReport(
             stage=f"{stage_name} ({model_cls})",
             max_running_requests=max_running_requests,
@@ -296,6 +395,8 @@ def validate_stage(
             is_valid=True,
             findings=["CUDA graph is disabled; capture coverage audit skipped."],
         )
+    else:
+        pass
 
     try:
         request_slots = model_runner.req_to_token_pool.size

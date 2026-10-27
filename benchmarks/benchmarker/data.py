@@ -4,6 +4,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
+
+
+class FinishReason(str, Enum):
+    """Why a generation ended; UNKNOWN when the server reported no reason."""
+
+    UNKNOWN = "unknown"
+    STOP = "stop"
+    LENGTH = "length"
 
 
 @dataclass
@@ -18,10 +27,21 @@ class RequestResult:
     completion_tokens: int = 0
     engine_time_s: float = 0.0
     tok_per_s: float = 0.0
+    finish_reason: FinishReason = FinishReason.UNKNOWN
+    speech_outcome_id: str = ""
+    server_worker_id: str = ""
     wav_path: str = ""
     error: str = ""
     audio_ttfp_s: float | None = None
     inter_chunk_s: list[float] = field(default_factory=list)
+    chunk_audio_duration_s: list[float] = field(default_factory=list)
+    max_playback_underrun_s: float | None = None
     text_ttft_s: float | None = None
     audio_chunk_count: int = 0
     first_audio_payload_bytes: int = 0
+    # note (luojiaxuan): the client-side slot cap was busy when this request
+    # arrived, so its clock started late and it was not open loop.
+    waited_for_slot: bool = False
+    # note (luojiaxuan): open-loop runs only; how long after its planned
+    # arrival the request was actually sent.
+    dispatch_lateness_s: float | None = None

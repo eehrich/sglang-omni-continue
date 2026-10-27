@@ -3,24 +3,52 @@
 
 from __future__ import annotations
 
-import base64
 import collections
 import hashlib
-import io
+import os
 import re
+import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
+from transformers import PretrainedConfig
 
-from sglang_omni.models.moss_tts.payload_types import MossTTSState
+from sglang_omni.models.moss_tts.hf_loading import (
+    MossAudioReference,
+    MossDelayReferences,
+    MossProcessorConfigSource,
+    MossRequestProcessor,
+    MossUserMessage,
+)
+from sglang_omni.models.moss_tts.payload_types import (
+    AUDIO_REPETITION_PENALTY,
+    AUDIO_SAMPLING,
+    TEXT_SAMPLING,
+    MossTTSState,
+    resolve_moss_audio_pad_code,
+)
+from sglang_omni.models.moss_tts.reference_encoder import MossReferenceEncoder
 from sglang_omni.proto import StagePayload
+from sglang_omni.proto.request import MOSS_CONTINUATION_PARAM, tts_param_flag
 from sglang_omni.sampling.seed import derive_sampling_seed, new_random_sampling_seed
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.prepared_request_queue import PreparedRequestQueue
-from sglang_omni.scheduling.types import ARRequestData
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
+from sglang_omni.scheduling.types import ARRequestData, RequestOutput
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 from sglang_omni.utils.ref_codes import REF_CODES_PARAM, decode_reference_codes
+
+if TYPE_CHECKING:
+    from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
+
+else:
+    pass
+
 
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
@@ -30,7 +58,7 @@ _DATA_URI_RE = re.compile(r"^data:audio/[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
 _INF_DELAY = -1
 
 
-def _new_moss_tts_sampling_seed() -> int:
+def new_moss_tts_sampling_seed() -> int:
     return new_random_sampling_seed()
 
 
@@ -66,38 +94,50 @@ class MossTTSSGLangRequestData(ARRequestData):
     """Scheduler-owned request state for MOSS-TTS Delay."""
 
     enforce_request_limits: bool = True
-    req: Any = None
+    req: Req | None = None
     synced: bool = False
     generation_steps: int = 0
     suppress_tokens: list[int] | None = None
     input_embeds_are_projected: bool = False
-    prefill_input_embeds: torch.Tensor | None = None
-    decode_input_embeds: list[torch.Tensor] = field(default_factory=list)
-    stage_payload: Any = None
+    stage_payload: StagePayload | None = None
     state: MossTTSState = field(default_factory=MossTTSState)
-    model_config: Any = None
+    model_config: PretrainedConfig | None = None
     prompt_rows: torch.Tensor | None = None
     assistant_prefix_rows: torch.Tensor | None = None
     output_rows: list[torch.Tensor] = field(default_factory=list)
-    pending_feedback_queue: Any = field(default_factory=collections.deque)
-    text_temperature: float = 1.5
-    text_top_p: float = 1.0
-    text_top_k: int = 50
-    audio_temperature: float = 1.7
-    audio_top_p: float = 0.8
-    audio_top_k: int = 25
-    audio_repetition_penalty: float = 1.0
+    stream_audio_active: bool = False
+    stream_audio_ended: bool = False
+    stream_prefix_scanned: bool = False
+    stream_output_row_count: int = 0
+    stream_row_count: int = 0
+    pending_feedback_queue: collections.deque[torch.Tensor] | list[torch.Tensor] = (
+        field(default_factory=collections.deque)
+    )
+    text_temperature: float = TEXT_SAMPLING.temperature
+    text_top_p: float = TEXT_SAMPLING.top_p
+    text_top_k: int = TEXT_SAMPLING.top_k
+    audio_temperature: float = AUDIO_SAMPLING.temperature
+    audio_top_p: float = AUDIO_SAMPLING.top_p
+    audio_top_k: int = AUDIO_SAMPLING.top_k
+    audio_repetition_penalty: float = AUDIO_REPETITION_PENALTY
     seed: int | None = None
-    sampling_seed: int = field(default_factory=_new_moss_tts_sampling_seed)
+    sampling_seed: int = field(default_factory=new_moss_tts_sampling_seed)
     delay_state: torch.Tensor | None = None
-    # Schwanz des ROHEN Prefix-Rasters, [n_vq-1, n_vq]: die Frames, deren
-    # feine Codes die Truncation abgeschnitten hat. seam_step zaehlt die
-    # erzeugten Audiozeilen, solange davon noch etwas offen ist.
+    # Tail of the RAW continuation prefix grid, [n_vq-1, n_vq]: the frames
+    # whose fine codes the truncation cut. seam_step counts the generated audio
+    # rows while some of those cells are still open (see sample_rows).
     seam_tail: torch.Tensor | None = None
     seam_step: int = 0
     audio_length: int = 0
     delayed_length: int = _INF_DELAY
     is_audio: bool = False
+    # note (rsi): launch-side step counter; under lookahead decode the committed
+    # generation_steps lags the launched step by one.
+    sampling_steps: int = 0
+    # Step that emits audio_end, known once the delay countdown starts; the
+    # step after it samples the full text vocabulary. Derived from output_rows.
+    audio_end_step: int | None = None
+    audio_end_scanned_rows: int = 0
     engine_start_s: float = 0.0
 
 
@@ -109,32 +149,67 @@ class MossTTSPreparedRequest:
     input_ids_list: list[int]
     input_ids: torch.Tensor
     prompt_rows: torch.Tensor
-    gen_kwargs: dict[str, Any]
-    # Nur bei Continuation gesetzt: das rohe Prefix-Raster [T, n_vq], aus dem
-    # die abgeschnittenen Zellen der Delay-Naht stammen.
-    prefix_codes: Any = None
+    gen_kwargs: Mapping[str, int | float]
+    # Continuation only: the raw prefix grid [T, n_vq] the delay-seam cells
+    # come from (see seed_seam_tail).
+    prefix_codes: torch.Tensor | None = None
 
 
 @dataclass
 class MossTTSPreprocessingContext:
-    processor: Any
+    processor: MossRequestProcessor[MossDelayReferences]
+    reference_encoder: MossReferenceEncoder | None = None
 
 
 _QUEUE: PreparedRequestQueue[MossTTSPreprocessingContext, MossTTSPreparedRequest] = (
     PreparedRequestQueue()
 )
+_CONTEXT_LIFECYCLE_LOCK = threading.Lock()
 
 
-def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
+def close_moss_tts_preprocessing_context(
+    context: MossTTSPreprocessingContext | None,
+) -> None:
+    if context is None:
+        return
+    else:
+        pass
+    close = getattr(context.reference_encoder, "close", None)
+    if callable(close):
+        close()
+    else:
+        pass
+
+
+def set_moss_tts_preprocessing_context(
+    *,
+    processor: MossRequestProcessor[MossDelayReferences],
+    reference_encoder: MossReferenceEncoder | None = None,
+) -> None:
     """Register the upstream MOSS processor used by preprocessing."""
 
-    _QUEUE.set_context(MossTTSPreprocessingContext(processor=processor))
+    with _CONTEXT_LIFECYCLE_LOCK:
+        previous = _QUEUE.snapshot().context
+        _QUEUE.set_context(
+            MossTTSPreprocessingContext(
+                processor=processor,
+                reference_encoder=reference_encoder,
+            )
+        )
+        if previous is not None and previous.reference_encoder is reference_encoder:
+            return
+        else:
+            pass
+        close_moss_tts_preprocessing_context(previous)
 
 
 def clear_moss_tts_preprocessing_context() -> None:
     """Clear MOSS-TTS preprocessing globals, mainly for tests and reloads."""
 
-    _QUEUE.clear_context()
+    with _CONTEXT_LIFECYCLE_LOCK:
+        previous = _QUEUE.snapshot().context
+        _QUEUE.clear_context()
+        close_moss_tts_preprocessing_context(previous)
 
 
 def cleanup_prepared_moss_tts_request(request_id: str) -> None:
@@ -155,32 +230,42 @@ def pop_prepared_moss_tts_request(
     marker = data.get(_MOSS_TTS_PREPARED_MARKER)
     if marker is None:
         return None
+    else:
+        pass
     prepared = _QUEUE.pop(str(marker))
     if prepared is None:
         raise RuntimeError(
             "MOSS-TTS preprocessing state is missing for prepared payload "
             f"{marker!r}; the AR scheduler must not rebuild it"
         )
+    else:
+        pass
     return prepared
 
 
-def normalize_moss_tts_inputs(inputs: Any) -> tuple[str, list[dict[str, Any]]]:
+def normalize_moss_tts_inputs(inputs: object) -> tuple[str, list[dict[str, object]]]:
     if isinstance(inputs, str):
         return inputs, []
+    else:
+        pass
     if isinstance(inputs, dict):
         references = inputs.get("references") or []
         if not isinstance(references, list):
             raise ValueError("MOSS-TTS references must be a list")
+        else:
+            pass
         return str(inputs.get("text", inputs.get("input", ""))), [
             dict(reference) for reference in references if isinstance(reference, dict)
         ]
+    else:
+        pass
     return str(inputs) if inputs is not None else "", []
 
 
 def resolve_moss_reference(
-    references: list[dict[str, Any]],
-    tts_params: dict[str, Any],
-) -> tuple[Any | None, str | None]:
+    references: list[dict[str, object]],
+    tts_params: Mapping[str, object],
+) -> tuple[object, str | None]:
     reference = references[0] if references else {}
     ref_audio = (
         reference.get("audio_path")
@@ -193,17 +278,19 @@ def resolve_moss_reference(
     return ref_audio, str(ref_text) if ref_text is not None else None
 
 
-def _resolve_optional_text(value: Any) -> str | None:
+def resolve_optional_text(value: object) -> str | None:
     if value is None:
         return None
+    else:
+        pass
     text = str(value).strip()
     return text or None
 
 
-def _resolve_token_count(
+def resolve_token_count(
     text: str,
-    params: dict[str, Any],
-    tts_params: dict[str, Any],
+    params: Mapping[str, object],
+    tts_params: Mapping[str, object],
 ) -> tuple[str, int | None]:
     """Resolve the duration token count and return ``(clean_text, count)``.
 
@@ -220,19 +307,31 @@ def _resolve_token_count(
                 value = source[key]
                 if isinstance(value, bool):
                     raise ValueError("MOSS-TTS token_count must be an integer")
+                else:
+                    pass
                 count = int(value)
                 if count <= 0:
                     raise ValueError("MOSS-TTS token_count must be > 0")
+                else:
+                    pass
                 return text, count
+            else:
+                pass
 
     match = _TOKEN_PREFIX_RE.match(text)
     if match:
         count = int(match.group(1))
         if count <= 0:
             raise ValueError("MOSS-TTS ${token:N} count must be > 0")
+        else:
+            pass
         return text[match.end() :].lstrip(), count
+    else:
+        pass
     if _TOKEN_PREFIX_START_RE.match(text):
         raise ValueError("MOSS-TTS ${token:N} count must be a positive integer")
+    else:
+        pass
     return text, None
 
 
@@ -243,19 +342,21 @@ def build_moss_tts_state(payload: StagePayload) -> MossTTSState:
     tts_params = metadata.get("tts_params")
     if not isinstance(tts_params, dict):
         tts_params = {}
+    else:
+        pass
 
     text, references = normalize_moss_tts_inputs(inputs)
     ref_audio, ref_text = resolve_moss_reference(references, tts_params)
-    language = _resolve_optional_text(
+    language = resolve_optional_text(
         tts_params.get("language") or params.get("language")
     )
-    instructions = _resolve_optional_text(
+    instructions = resolve_optional_text(
         tts_params.get("instructions")
         or tts_params.get("instruct")
         or params.get("instructions")
         or params.get("instruct")
     )
-    text, token_count = _resolve_token_count(text, params, tts_params)
+    text, token_count = resolve_token_count(text, params, tts_params)
     return MossTTSState(
         text=text,
         ref_audio=ref_audio,
@@ -268,16 +369,10 @@ def build_moss_tts_state(payload: StagePayload) -> MossTTSState:
 
 
 def build_generation_kwargs(
-    params: dict[str, Any],
+    params: Mapping[str, object],
     *,
-    tts_params: dict[str, Any],
-) -> dict[str, Any]:
-    explicit_generation_params = tts_params.get("explicit_generation_params")
-    if isinstance(explicit_generation_params, (list, tuple, set)):
-        explicit_fields = {str(field) for field in explicit_generation_params}
-    else:
-        explicit_fields = set()
-
+    tts_params: Mapping[str, object],
+) -> dict[str, int | float]:
     raw_max_new_tokens = params.get("max_new_tokens")
     if raw_max_new_tokens is None:
         max_new_tokens = MOSS_TTS_DEFAULT_MAX_NEW_TOKENS
@@ -288,36 +383,41 @@ def build_generation_kwargs(
     else:
         max_new_tokens = int(raw_max_new_tokens)
 
-    generation_kwargs: dict[str, Any] = {
+    generation_kwargs: dict[str, object] = {
         "max_new_tokens": max_new_tokens,
         # note (chenyang): the checkpoint's own generate() defaults; greedy
         # (temperature=0) collapses the codec LM into copying the reference
         # audio. Callers may override any field.
-        "text_temperature": 1.5,
-        "audio_temperature": 1.7,
-        "text_top_p": 1.0,
-        "audio_top_p": 0.8,
-        "text_top_k": 50,
-        "audio_top_k": 25,
-        "audio_repetition_penalty": 1.0,
+        "text_temperature": TEXT_SAMPLING.temperature,
+        "audio_temperature": AUDIO_SAMPLING.temperature,
+        "text_top_p": TEXT_SAMPLING.top_p,
+        "audio_top_p": AUDIO_SAMPLING.top_p,
+        "text_top_k": TEXT_SAMPLING.top_k,
+        "audio_top_k": AUDIO_SAMPLING.top_k,
+        "audio_repetition_penalty": AUDIO_REPETITION_PENALTY,
     }
 
-    if "temperature" in explicit_fields and params.get("temperature") is not None:
+    if params.get("temperature") is not None:
         generation_kwargs["text_temperature"] = float(params["temperature"])
         generation_kwargs["audio_temperature"] = float(params["temperature"])
-    if "top_p" in explicit_fields and params.get("top_p") is not None:
+    else:
+        pass
+    if params.get("top_p") is not None:
         generation_kwargs["text_top_p"] = float(params["top_p"])
         generation_kwargs["audio_top_p"] = float(params["top_p"])
-    if "top_k" in explicit_fields and params.get("top_k") is not None:
+    else:
+        pass
+    if params.get("top_k") is not None:
         generation_kwargs["text_top_k"] = int(params["top_k"])
         generation_kwargs["audio_top_k"] = int(params["top_k"])
-    if (
-        "repetition_penalty" in explicit_fields
-        and params.get("repetition_penalty") is not None
-    ):
+    else:
+        pass
+    if params.get("repetition_penalty") is not None:
         generation_kwargs["audio_repetition_penalty"] = float(
             params["repetition_penalty"]
         )
+    else:
+        pass
 
     for source in (tts_params, params):
         for param_name in (
@@ -334,49 +434,67 @@ def build_generation_kwargs(
                 generation_kwargs[param_name] = (
                     int(value) if param_name.endswith("top_k") else float(value)
                 )
+            else:
+                pass
 
     seed = tts_params.get("seed")
     if seed is None:
         seed = params.get("seed")
+    else:
+        pass
     if seed is not None:
         generation_kwargs["seed"] = seed
+    else:
+        pass
 
-    _validate_moss_tts_generation_kwargs(generation_kwargs)
+    validate_moss_tts_generation_kwargs(generation_kwargs)
     return generation_kwargs
 
 
-def _validate_moss_tts_generation_kwargs(kwargs: dict[str, Any]) -> None:
+def validate_moss_tts_generation_kwargs(kwargs: Mapping[str, object]) -> None:
     """Validate public sampling fields (MOSS uses a custom sampler that bypasses
     SGLang's SamplingParams.verify), raising ValueError on out-of-range values."""
     if int(kwargs["max_new_tokens"]) <= 0:
         raise ValueError(
             f"MOSS-TTS max_new_tokens must be > 0, got {kwargs['max_new_tokens']!r}"
         )
+    else:
+        pass
     for param_name in ("text_temperature", "audio_temperature"):
         if float(kwargs[param_name]) < 0:
             raise ValueError(
                 f"MOSS-TTS {param_name} must be >= 0, got {kwargs[param_name]!r}"
             )
+        else:
+            pass
     for param_name in ("text_top_p", "audio_top_p"):
         if not 0.0 < float(kwargs[param_name]) <= 1.0:
             raise ValueError(
                 f"MOSS-TTS {param_name} must be in (0, 1], got {kwargs[param_name]!r}"
             )
+        else:
+            pass
     for param_name in ("text_top_k", "audio_top_k"):
         if int(kwargs[param_name]) < -1:
             raise ValueError(
                 f"MOSS-TTS {param_name} must be >= -1, got {kwargs[param_name]!r}"
             )
+        else:
+            pass
     if float(kwargs["audio_repetition_penalty"]) <= 0:
         raise ValueError(
             "MOSS-TTS audio_repetition_penalty must be > 0, got "
             f"{kwargs['audio_repetition_penalty']!r}"
         )
+    else:
+        pass
     seed = kwargs.get("seed")
     if seed is not None and (
         isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
     ):
         raise ValueError(f"MOSS-TTS seed must be a non-negative integer, got {seed!r}")
+    else:
+        pass
 
 
 def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
@@ -390,25 +508,26 @@ def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
     return key_ids
 
 
-def resolve_moss_tts_ref_codes(
+def resolve_moss_ref_codes(
     payload: StagePayload,
     *,
-    processor: Any,
+    processor: MossProcessorConfigSource,
+    key: str = REF_CODES_PARAM,
 ) -> torch.Tensor | None:
-    """Decode + validate pre-computed reference codes for one request.
+    """Decode + validate pre-computed codec codes for one request.
 
-    Deliberately NOT a ``MossTTSState`` field: that state dict is msgpack'd on
-    the terminal stage hop, so a tensor parked on it kills the vocoder process,
+    Deliberately NOT a state field: the state dict is msgpack'd on the
+    terminal stage hop, so a tensor parked on it kills the vocoder process,
     and echoing the packed form through every stage would ship the reference
     twice. The codes are a preprocessing-local input, consumed while the prompt
-    rows are built and never needed again.
+    rows are built.
 
     Mirrors ``resolve_moss_reference`` on where it looks: a per-reference
     descriptor wins over the flat ``tts_params`` field, and codes win over
     ``ref_audio`` when both are present (same reference, already encoded).
 
-    Note the Delay model runs ``n_vq`` 32 against the Local Transformer's 12,
-    so codes cannot be carried across the two; the validator rejects the
+    The Delay model runs ``n_vq`` 32 against the Local Transformer's 12, so
+    codes cannot be carried across the two; the validator rejects the
     mismatch instead of cloning a garbage voice from it.
     """
     inputs = payload.request.inputs or {}
@@ -416,59 +535,66 @@ def resolve_moss_tts_ref_codes(
     tts_params = metadata.get("tts_params")
     if not isinstance(tts_params, dict):
         tts_params = {}
+    else:
+        pass
     _, references = normalize_moss_tts_inputs(inputs)
     reference = references[0] if references else {}
-    raw = reference.get(REF_CODES_PARAM) or tts_params.get(REF_CODES_PARAM)
+    raw = reference.get(key) or tts_params.get(key)
     if raw is None:
         return None
+    else:
+        pass
     cfg = processor.model_config
     audio_vocab_size = int(
         getattr(cfg, "audio_vocab_size", None) or getattr(cfg, "audio_pad_code", 1024)
     )
     return decode_reference_codes(
-        raw, n_vq=int(cfg.n_vq), audio_vocab_size=audio_vocab_size
+        raw, n_vq=int(cfg.n_vq), audio_vocab_size=audio_vocab_size, field=key
     )
 
 
-def _reference_for_processor(
-    processor: Any,
-    ref_audio: Any | None,
-    ref_codes: torch.Tensor | None = None,
-) -> list[Any] | None:
-    # Codes are what the encode below would have produced, so supplying them
-    # skips the encoder entirely -- which is also what makes a long re-anchored
-    # window usable here at all: encoding one in a single forward materialises
-    # O(T^2) attention state.
-    if ref_codes is not None:
-        return [ref_codes]
+def continuation_requested(payload: StagePayload) -> bool:
+    """``metadata.tts_params.continuation``: resume from the prior audio."""
+    return tts_param_flag(payload.request, MOSS_CONTINUATION_PARAM)
+
+
+def reference_for_processor(
+    processor: object,
+    ref_audio: MossAudioReference | None,
+    reference_encoder: MossReferenceEncoder | None = None,
+) -> list[str | torch.Tensor] | None:
     if ref_audio is None:
         return None
+    else:
+        pass
+    if isinstance(ref_audio, os.PathLike):
+        ref_audio = os.fsdecode(ref_audio)
+    else:
+        pass
     if not isinstance(ref_audio, str):
         return [ref_audio]
-    match = _DATA_URI_RE.match(ref_audio)
-    if match is None:
-        return [ref_audio]
-
-    try:
-        import soundfile as sf
-    except ImportError as exc:
-        raise RuntimeError(
-            "MOSS-TTS base64 reference audio requires soundfile to decode the data URI"
-        ) from exc
-
-    raw = base64.b64decode(match.group("data"))
-    audio, sample_rate = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(audio.T)
-    codes = processor.encode_audios_from_wav([wav], int(sample_rate))[0]
-    return [codes]
+    else:
+        pass
+    if reference_encoder is not None:
+        return [reference_encoder.encode(ref_audio)]
+    else:
+        pass
+    return [ref_audio]
 
 
-def _build_processor_message(
-    processor: Any,
+def build_processor_message(
+    processor: MossRequestProcessor[MossDelayReferences],
     state: MossTTSState,
+    reference_encoder: MossReferenceEncoder | None = None,
     ref_codes: torch.Tensor | None = None,
-) -> dict[str, Any]:
-    reference = _reference_for_processor(processor, state.ref_audio, ref_codes)
+) -> MossUserMessage:
+    # Codes are what the encode would have produced, so supplying them skips
+    # the encoder entirely.
+    reference = (
+        [ref_codes]
+        if ref_codes is not None
+        else reference_for_processor(processor, state.ref_audio, reference_encoder)
+    )
     return processor.build_user_message(
         text=state.text,
         reference=reference,
@@ -478,9 +604,10 @@ def _build_processor_message(
     )
 
 
-def _prior_audio_codes(
-    processor: Any,
+def prior_audio_codes(
+    processor: MossRequestProcessor[MossDelayReferences],
     state: MossTTSState,
+    reference_encoder: MossReferenceEncoder | None = None,
     ref_codes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Resolve the prior-segment codes for a continuation turn.
@@ -491,31 +618,35 @@ def _prior_audio_codes(
     """
     if ref_codes is not None:
         return ref_codes
-    reference = _reference_for_processor(processor, state.ref_audio)
-    if not reference:
+    else:
+        pass
+    reference = reference_for_processor(processor, state.ref_audio, reference_encoder)
+    if not reference or not isinstance(reference[0], torch.Tensor):
         raise ValueError("MOSS-TTS continuation requires a resolvable prior audio")
-    return torch.as_tensor(reference[0], dtype=torch.long)
+    else:
+        pass
+    return reference[0].to(dtype=torch.long)
 
 
-def _build_continuation_conversation(
-    processor: Any,
+def build_continuation_conversation(
+    processor: MossRequestProcessor[MossDelayReferences],
     state: MossTTSState,
-    ref_codes: torch.Tensor | None = None,
-) -> list[dict[str, Any]]:
+    *,
+    prior_codes: torch.Tensor,
+) -> list[MossUserMessage]:
     """Build a [user(full text), assistant(prior audio)] continuation turn.
 
     The prior audio goes into the ASSISTANT slot so the model resumes its own
     token stream instead of cloning from a reference. ``state.text`` already
     carries the concatenated previous+new text and ``state.token_count`` the
-    TOTAL (prefix + new) duration hint, mirroring the MOSSVoiceContinue node
-    the ComfyUI path drives -- the reference implementation for this mode.
+    TOTAL (prefix + new) duration hint, mirroring the MOSSVoiceContinue node --
+    the reference implementation for this mode.
 
     The user turn carries NO reference: the voice comes from the prefix. What
     the caller puts in that prefix decides the mode -- the last segment alone
     for ``sliding_window``, the base recording concatenated in front of it for
     ``sliding_window_ref_anchor``.
     """
-    prior_codes = _prior_audio_codes(processor, state, ref_codes)
     user_message = processor.build_user_message(
         text=state.text,
         reference=None,
@@ -529,39 +660,41 @@ def _build_continuation_conversation(
     return [user_message, assistant_message]
 
 
-def _prepare_moss_tts_request(
+def prepare_moss_tts_request(
     payload: StagePayload,
     *,
-    processor: Any,
+    processor: MossRequestProcessor[MossDelayReferences],
+    reference_encoder: MossReferenceEncoder | None = None,
 ) -> MossTTSPreparedRequest:
     state = build_moss_tts_state(payload)
-    ref_codes = resolve_moss_tts_ref_codes(payload, processor=processor)
-    metadata = (
-        payload.request.metadata
-        if isinstance(payload.request.metadata, dict)
-        else {}
-    )
-    tts_params = metadata.get("tts_params")
-    continuation = (
-        bool(tts_params.get("continuation"))
-        if isinstance(tts_params, dict)
-        else False
-    )
-    prefix_codes = None
-    if continuation and (ref_codes is not None or state.ref_audio is not None):
-        conversation = _build_continuation_conversation(processor, state, ref_codes)
+    ref_codes = resolve_moss_ref_codes(payload, processor=processor)
+    prefix_codes: torch.Tensor | None = None
+    if continuation_requested(payload) and (
+        ref_codes is not None or state.ref_audio is not None
+    ):
+        prior_codes = prior_audio_codes(processor, state, reference_encoder, ref_codes)
+        conversation = build_continuation_conversation(
+            processor, state, prior_codes=prior_codes
+        )
         batch = processor([conversation], mode="continuation")
-        # Vor der Delay-Faltung festhalten: der Prozessor schneidet gleich die
-        # Auslauf-Rampe ab, und danach sind diese Werte nicht mehr ableitbar.
-        prefix_codes = _continuation_prefix_codes(conversation)
+        # Keep the raw grid: the processor truncates the delay ramp of the
+        # prefix, and the cut cells cannot be derived from the prompt rows.
+        if prior_codes.ndim == 2 and int(prior_codes.shape[0]) >= 2:
+            prefix_codes = prior_codes
+        else:
+            pass
     else:
-        message = _build_processor_message(processor, state, ref_codes)
+        message = build_processor_message(
+            processor, state, reference_encoder, ref_codes
+        )
         batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
         raise ValueError(
             "MOSS-TTS processor must return input_ids with shape [1, T, C]"
         )
+    else:
+        pass
     prompt_rows = input_rows[0].detach().to(dtype=torch.long, device="cpu")
     input_ids_list = build_row_cache_key_ids(prompt_rows)
     return MossTTSPreparedRequest(
@@ -574,28 +707,6 @@ def _prepare_moss_tts_request(
     )
 
 
-def _continuation_prefix_codes(conversation: list) -> Any:
-    """Rohes [T, n_vq] Raster aus der Assistant-Nachricht der Continuation.
-
-    Genommen wird die Nachricht, die in den ASSISTANT-Slot geht -- das ist der
-    Prefix, den das Modell fortsetzt. Fehlt sie oder hat sie eine andere Form,
-    gibt es None und die Naht bleibt wie bisher (das Modell raet); ein
-    fehlender Schwanz darf keine Anfrage scheitern lassen.
-    """
-    for message in reversed(conversation):
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        codes_list = message.get("audio_codes_list") or []
-        if not codes_list:
-            return None
-        codes = codes_list[-1]
-        shape = getattr(codes, "shape", None)
-        if shape is None or len(shape) != 2 or int(shape[0]) < 2:
-            return None
-        return codes
-    return None
-
-
 def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     """Run MOSS-TTS prompt/reference preprocessing outside the AR scheduler."""
 
@@ -606,9 +717,15 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
             "MOSS-TTS preprocessing context is not initialized; "
             "create_preprocessing_executor must register it before requests run"
         )
+    else:
+        pass
 
     try:
-        prepared = _prepare_moss_tts_request(payload, processor=context.processor)
+        prepared = prepare_moss_tts_request(
+            payload,
+            processor=context.processor,
+            reference_encoder=context.reference_encoder,
+        )
     except BaseException:
         _QUEUE.fail_inflight(rid)
         raise
@@ -620,20 +737,24 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     data = prepared.state.to_dict()
     if published:
         data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id
+    else:
+        pass
     return StagePayload(
         request_id=payload.request_id, request=payload.request, data=data
     )
 
 
-def _last_equal(rows: torch.Tensor, value: int) -> int:
+def last_equal(rows: torch.Tensor, value: int) -> int:
     matches = (rows[:, 0] == int(value)).nonzero(as_tuple=False).flatten()
     if matches.numel() == 0:
         return -1
+    else:
+        pass
     return int(matches[-1].item())
 
 
-def _resolve_audio_payload_bounds(
-    rows: torch.Tensor, cfg: Any
+def resolve_audio_payload_bounds(
+    rows: torch.Tensor, cfg: PretrainedConfig
 ) -> tuple[int, int] | None:
     text = rows[:, 0].to(dtype=torch.long)
     bos_pos = (text == int(cfg.audio_start_token_id)).nonzero(as_tuple=False)
@@ -643,6 +764,8 @@ def _resolve_audio_payload_bounds(
         )
         if gen_pos.numel() == 0:
             return None
+        else:
+            pass
         start = int(gen_pos[0].item())
     else:
         start = int(bos_pos[0].item()) + 1
@@ -659,54 +782,216 @@ def _resolve_audio_payload_bounds(
             matches = (text[start:] == token_id).nonzero(as_tuple=False)
             if matches.numel() > 0:
                 end_candidates.append(start + int(matches[-1].item()) + 1)
+            else:
+                pass
         if not end_candidates:
             return None
+        else:
+            pass
         end = max(end_candidates)
 
     n_vq = int(rows.shape[1] - 1)
     if end <= start or end <= start + n_vq:
         return None
+    else:
+        pass
     return start, end
 
 
-def _seed_seam_tail(
+def seed_seam_tail(
     data: MossTTSSGLangRequestData,
-    prefix_codes: Any,
+    prefix_codes: torch.Tensor | None,
     *,
-    model: Any,
+    model: MossTTSDelaySGLangModel,
 ) -> None:
-    """Letzte n_vq-1 Frames des Rohrasters an die Anfrage haengen.
+    """Attach the last n_vq-1 frames of the raw prefix grid to the request.
 
-    Genau diese Frames hat die Truncation halbiert: ihre feinen Codes stehen
-    in den Zeilen, die der Prozessor abgeschnitten hat. Der Sampler setzt sie
-    aus diesem Schwanz wieder ein, statt sie erzeugen zu lassen.
+    Exactly these frames lost their fine codes to the continuation truncation:
+    those codes sat in the rows the processor cut. The sampler re-inserts them
+    from this tail instead of letting the model guess them.
     """
     if prefix_codes is None:
         return
+    else:
+        pass
     n_vq = int(getattr(model.config, "n_vq", 0) or 0)
-    if n_vq < 2:
-        return
-    try:
-        tail = torch.as_tensor(prefix_codes, dtype=torch.long)
-    except Exception:  # noqa: BLE001 - ein unbrauchbarer Schwanz ist kein Fehler
-        return
-    if tail.ndim != 2 or int(tail.shape[1]) != n_vq:
-        return
     span = n_vq - 1
-    if int(tail.shape[0]) < span:
+    tail = prefix_codes.to(dtype=torch.long)
+    if span < 1 or tail.ndim != 2 or int(tail.shape[1]) != n_vq:
         return
+    elif int(tail.shape[0]) < span:
+        return
+    else:
+        pass
     data.seam_tail = tail[-span:].detach().clone()
     data.seam_step = 0
 
 
-def _initialize_generation_state(
+def moss_stream_metadata(
     data: MossTTSSGLangRequestData,
     *,
-    model: Any,
+    n_vq: int,
+) -> dict[str, object]:
+    config = data.model_config
+    metadata: dict[str, object] = {
+        "modality": "audio_codes",
+        "stream": True,
+        "n_vq": int(n_vq),
+        "audio_pad_code": resolve_moss_audio_pad_code(config),
+        "sample_rate": int(
+            data.state.sample_rate or getattr(config, "sampling_rate", 0) or 24000
+        ),
+    }
+    params = getattr(getattr(data.stage_payload, "request", None), "params", None)
+    if (
+        isinstance(params, dict)
+        and params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None
+    ):
+        metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
+            INITIAL_CODEC_CHUNK_FRAMES_PARAM
+        ]
+    else:
+        pass
+    return metadata
+
+
+def collect_moss_stream_rows(
+    data: MossTTSSGLangRequestData,
+    req_output: RequestOutput | None,
+) -> list[torch.Tensor]:
+    config = data.model_config
+    rows: list[torch.Tensor] = []
+
+    if not data.stream_prefix_scanned:
+        prefix = data.assistant_prefix_rows
+        if isinstance(prefix, torch.Tensor) and prefix.ndim == 2:
+            for row in prefix.unbind(0):
+                token = int(row[0].item())
+                if token == int(config.audio_start_token_id):
+                    data.stream_audio_active = True
+                    data.stream_audio_ended = False
+                    continue
+                else:
+                    pass
+                if token == int(config.audio_end_token_id):
+                    data.stream_audio_active = False
+                    data.stream_audio_ended = True
+                    continue
+                else:
+                    pass
+                if not data.stream_audio_active and token == int(
+                    config.audio_assistant_gen_slot_token_id
+                ):
+                    data.stream_audio_active = True
+                else:
+                    pass
+                if data.stream_audio_active and not data.stream_audio_ended:
+                    rows.append(row[1:].detach().clone())
+                else:
+                    pass
+        else:
+            pass
+        data.stream_prefix_scanned = True
+    else:
+        pass
+
+    output_rows = data.output_rows
+    start = min(int(data.stream_output_row_count), len(output_rows))
+    for index in range(start, len(output_rows)):
+        row = output_rows[index]
+        token = (
+            int(req_output.data)
+            if index == len(output_rows) - 1 and req_output.data is not None
+            else int(row[0].item())
+        )
+        if token == int(config.audio_start_token_id):
+            data.stream_audio_active = True
+            data.stream_audio_ended = False
+            continue
+        else:
+            pass
+        if token == int(config.audio_end_token_id):
+            data.stream_audio_active = False
+            data.stream_audio_ended = True
+            continue
+        else:
+            pass
+        if not data.stream_audio_active and token == int(
+            config.audio_assistant_gen_slot_token_id
+        ):
+            data.stream_audio_active = True
+        else:
+            pass
+        if data.stream_audio_active and not data.stream_audio_ended:
+            rows.append(row[1:].detach().clone())
+        else:
+            pass
+    data.stream_output_row_count = len(output_rows)
+    return rows
+
+
+def make_moss_tts_stream_output_builder() -> (
+    Callable[
+        [str, MossTTSSGLangRequestData, RequestOutput | None], list[OutgoingMessage]
+    ]
+):
+    """Build incremental delayed-code chunks for streaming requests."""
+
+    def stream_output_builder(
+        request_id: str,
+        data: MossTTSSGLangRequestData,
+        req_output: RequestOutput | None,
+    ) -> list[OutgoingMessage]:
+        params = getattr(getattr(data.stage_payload, "request", None), "params", None)
+        if not isinstance(params, dict) or not bool(params.get("stream", False)):
+            return []
+        else:
+            pass
+        req = data.req
+        if req is not None and int(getattr(req, "inflight_middle_chunks", 0) or 0):
+            return []
+        else:
+            pass
+
+        rows = collect_moss_stream_rows(data, req_output)
+        if not rows:
+            return []
+        else:
+            pass
+        n_vq = int(rows[0].shape[0])
+        if n_vq <= 0 or any(int(row.shape[0]) != n_vq for row in rows):
+            raise RuntimeError("MOSS-TTS stream rows have inconsistent codebook widths")
+        else:
+            pass
+
+        row_index = int(data.stream_row_count)
+        data.stream_row_count += len(rows)
+        chunk = rows[0] if len(rows) == 1 else torch.stack(rows, dim=0)
+        metadata = moss_stream_metadata(data, n_vq=n_vq)
+        metadata["row_index"] = row_index
+        return [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                target="vocoder",
+                data=chunk,
+                metadata=metadata,
+            )
+        ]
+
+    return stream_output_builder
+
+
+def initialize_generation_state(
+    data: MossTTSSGLangRequestData,
+    *,
+    model: MossTTSDelaySGLangModel | None,
 ) -> None:
     prompt_rows = data.prompt_rows
     if prompt_rows is None or prompt_rows.numel() == 0:
         return
+    else:
+        pass
     cfg = model.config
     seq_len = int(prompt_rows.shape[0])
     last_text = int(prompt_rows[-1, 0].item())
@@ -714,10 +999,10 @@ def _initialize_generation_state(
         int(cfg.audio_start_token_id),
         int(cfg.audio_assistant_gen_slot_token_id),
     )
-    audio_start_idx = _last_equal(prompt_rows, int(cfg.audio_start_token_id))
+    audio_start_idx = last_equal(prompt_rows, int(cfg.audio_start_token_id))
     data.is_audio = bool(is_continuation and audio_start_idx >= 0)
     data.audio_length = seq_len - audio_start_idx if data.is_audio else 0
-    assistant_start_idx = _last_equal(prompt_rows, int(cfg.im_start_token_id)) + 3
+    assistant_start_idx = last_equal(prompt_rows, int(cfg.im_start_token_id)) + 3
     assistant_start_idx = max(0, min(assistant_start_idx, seq_len))
     data.assistant_prefix_rows = prompt_rows[assistant_start_idx:].detach().clone()
     data.state.assistant_start_length = int(data.assistant_prefix_rows.shape[0])
@@ -726,17 +1011,16 @@ def _initialize_generation_state(
 def build_sglang_moss_tts_request(
     payload: StagePayload,
     *,
-    model: Any,
+    model: MossTTSDelaySGLangModel,
 ) -> MossTTSSGLangRequestData:
-    from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.sampling.sampling_params import SamplingParams
-
     prepared = pop_prepared_moss_tts_request(payload)
     if prepared is None:
         raise RuntimeError(
             "MOSS-TTS AR request builder requires a payload prepared by "
             "preprocess_moss_tts_payload"
         )
+    else:
+        pass
 
     cfg = model.config
     gen_kwargs = prepared.gen_kwargs
@@ -758,10 +1042,15 @@ def build_sglang_moss_tts_request(
         sampling_params=sampling_params,
         eos_token_ids={int(cfg.im_end_token_id)},
         vocab_size=int(cfg.vocab_size_list[0]),
+        extra_key="moss_tts:prompt:v1",
     )
     req.tokenizer = None
-    req._input_embeds_are_projected = True
-    req._codec_suppress_tokens = None
+    req._input_embeds_are_projected = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    req._omni_prompt_only_radix = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    req._omni_prompt_cache_key = (
+        req.extra_key
+    )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    req._codec_suppress_tokens = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
     data = MossTTSSGLangRequestData(
         input_ids=prepared.input_ids,
@@ -772,24 +1061,33 @@ def build_sglang_moss_tts_request(
         state=prepared.state,
         model_config=cfg,
         prompt_rows=prepared.prompt_rows,
-        text_temperature=float(gen_kwargs.get("text_temperature", 0.0)),
-        text_top_p=float(gen_kwargs.get("text_top_p", 1.0)),
-        text_top_k=int(gen_kwargs.get("text_top_k", -1)),
-        audio_temperature=float(gen_kwargs.get("audio_temperature", 0.0)),
-        audio_top_p=float(gen_kwargs.get("audio_top_p", 1.0)),
-        audio_top_k=int(gen_kwargs.get("audio_top_k", -1)),
-        audio_repetition_penalty=float(gen_kwargs.get("audio_repetition_penalty", 1.0)),
+        text_temperature=float(
+            gen_kwargs.get("text_temperature", TEXT_SAMPLING.temperature)
+        ),
+        text_top_p=float(gen_kwargs.get("text_top_p", TEXT_SAMPLING.top_p)),
+        text_top_k=int(gen_kwargs.get("text_top_k", TEXT_SAMPLING.top_k)),
+        audio_temperature=float(
+            gen_kwargs.get("audio_temperature", AUDIO_SAMPLING.temperature)
+        ),
+        audio_top_p=float(gen_kwargs.get("audio_top_p", AUDIO_SAMPLING.top_p)),
+        audio_top_k=int(gen_kwargs.get("audio_top_k", AUDIO_SAMPLING.top_k)),
+        audio_repetition_penalty=float(
+            gen_kwargs.get(
+                "audio_repetition_penalty",
+                AUDIO_REPETITION_PENALTY,
+            )
+        ),
         seed=gen_kwargs.get("seed"),
         sampling_seed=(
             derive_moss_tts_sampling_seed(gen_kwargs["seed"])
             if gen_kwargs.get("seed") is not None
-            else _new_moss_tts_sampling_seed()
+            else new_moss_tts_sampling_seed()
         ),
         engine_start_s=time.perf_counter(),
     )
     data.input_embeds_are_projected = True
-    _seed_seam_tail(data, prepared.prefix_codes, model=model)
-    _initialize_generation_state(data, model=model)
+    seed_seam_tail(data, prepared.prefix_codes, model=model)
+    initialize_generation_state(data, model=model)
     data.stage_payload = payload
     return data
 
@@ -813,7 +1111,7 @@ def apply_sglang_moss_tts_result(
             )
         else:
             rows = generated_rows
-        bounds = _resolve_audio_payload_bounds(rows, data.model_config)
+        bounds = resolve_audio_payload_bounds(rows, data.model_config)
         if bounds is None:
             payload_rows = rows
         else:
@@ -853,7 +1151,10 @@ def apply_sglang_moss_tts_result(
     )
 
 
-def make_moss_tts_scheduler_adapters(*, model: Any):
+def make_moss_tts_scheduler_adapters(*, model: MossTTSDelaySGLangModel | None) -> tuple[
+    Callable[[StagePayload], MossTTSSGLangRequestData],
+    Callable[[MossTTSSGLangRequestData], StagePayload],
+]:
     """Build StagePayload <-> SGLang request adapters for MOSS-TTS."""
 
     def request_builder(payload: StagePayload) -> MossTTSSGLangRequestData:

@@ -3,10 +3,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
-from sglang_omni.scheduling.pipeline_state import DeclarativeStateBase, wire
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import DeclarativeStateBase
+from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
+from sglang_omni.scheduling.pipeline_state import store_state as _store_pipeline_state
+from sglang_omni.scheduling.pipeline_state import wire
+
+if TYPE_CHECKING:
+    import torch
+    from transformers import PretrainedConfig
+
+    from sglang_omni.models.moss_tts.hf_loading import MossAudioConfig
+else:
+    pass
+
+
+@dataclass(frozen=True)
+class ChannelSampling:
+    """Sampling defaults for one MOSS-TTS channel group."""
+
+    temperature: float
+    top_p: float
+    top_k: int
+
+
+TEXT_SAMPLING = ChannelSampling(temperature=1.5, top_p=1.0, top_k=50)
+AUDIO_SAMPLING = ChannelSampling(temperature=1.7, top_p=0.8, top_k=25)
+AUDIO_REPETITION_PENALTY = 1.0
 
 
 def moss_tts_special_token_defaults(
@@ -26,17 +53,39 @@ def moss_tts_special_token_defaults(
     )
 
 
+def resolve_moss_audio_pad_code(
+    config: MossAudioConfig | PretrainedConfig | None,
+) -> int:
+    value = getattr(config, "audio_pad_code", None)
+    if value is not None:
+        return int(value)
+    else:
+        pass
+    audio_vocab_size = int(getattr(config, "audio_vocab_size", 1024) or 1024)
+    return dict(moss_tts_special_token_defaults(audio_vocab_size))["audio_pad_code"]
+
+
 @dataclass
 class MossTTSState(DeclarativeStateBase):
     """Per-request state for MOSS-TTS Delay generation."""
 
     sample_rate: int = wire(24000, codec="int_or")
     text: str = wire("", codec="str")
-    ref_audio: Any | None = None
+    ref_audio: object = None
     ref_text: str | None = None
     language: str | None = None
     instructions: str | None = None
     token_count: int | None = wire(None, codec="opt_int")
-    generation_kwargs: dict[str, Any] = wire(default_factory=dict, codec="dict")
-    delayed_audio_codes: Any | None = wire(None, codec="tensor_cpu")
+    generation_kwargs: Mapping[str, int | float] = wire(
+        default_factory=dict, codec="dict"
+    )
+    delayed_audio_codes: torch.Tensor | None = wire(None, codec="tensor_cpu")
     assistant_start_length: int = wire(0, emit="truthy", codec="int")
+
+
+def load_moss_tts_state(payload: StagePayload) -> MossTTSState:
+    return _load_pipeline_state(payload, MossTTSState)
+
+
+def store_moss_tts_state(payload: StagePayload, state: MossTTSState) -> StagePayload:
+    return _store_pipeline_state(payload, state)

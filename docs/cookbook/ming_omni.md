@@ -12,6 +12,8 @@ Install `sglang-omni` by following [Installation](../get_started/installation.md
 hf download inclusionAI/Ming-flash-omni-2.0
 ```
 
+For Intel GPUs, follow the [Ming-Omni XPU recipe](../get_started/installation_xpu.md#ming-omni-omni-chat-and-speech-one-or-two-xpus).
+
 The speech path expects the checkpoint to include the `talker/` assets, including `talker/data/voice_name.json` and `talker/vae/`. The default voice in the current Ming speech pipeline is `DB30`. `campplus.onnx` and `talker_tn` are optional runtime helpers: missing `campplus.onnx` disables speaker embedding extraction, and missing `talker_tn` falls back to identity text normalization.
 
 `Ming-flash-omni-2.0` on HF does not ship top-level thinker tokenizer files. `load_ming_tokenizer` falls back to `inclusionAI/Ming-flash-omni-Preview` (~12 MB) to copy `tokenizer.json`, `tokenizer_config.json`, and `special_tokens_map.json`. In offline environments, download those files too:
@@ -20,7 +22,7 @@ The speech path expects the checkpoint to include the `talker/` assets, includin
 hf download inclusionAI/Ming-flash-omni-Preview tokenizer.json tokenizer_config.json special_tokens_map.json
 ```
 
-Ming-flash-omni-2.0 is a large MoE model. For practical serving, use tensor parallelism for the thinker. The examples below use logical GPU ids inside `CUDA_VISIBLE_DEVICES`; with `CUDA_VISIBLE_DEVICES=0,1,2,3,4`, `--thinker-gpus 0,1,2,3` means the thinker uses the first four visible GPUs and `--talker-gpu 4` uses the fifth visible GPU.
+Ming-flash-omni-2.0 is a large MoE model. For practical serving, use tensor parallelism for the thinker. The examples below use logical GPU ids inside `CUDA_VISIBLE_DEVICES`; with `CUDA_VISIBLE_DEVICES=0,1,2,3,4`, `--thinker.gpu "[0, 1, 2, 3]"` means the thinker uses the first four visible GPUs and `--talker.gpu 4` uses the fifth visible GPU.
 
 ## Architecture
 
@@ -59,7 +61,7 @@ Use the selector below to generate the exact launch command for your configurati
 <div id="sgl-ming-server-gen-mount"></div>
 ```
 
-`--text-only` selects the thinker-only pipeline (no talker, no audio). Omit it for the speech pipeline, which adds a dedicated `--talker-gpu`. The talker GPU must not overlap the thinker TP placement (the only placement Ming validates), so the generator always keeps it separate. The vision encoder defaults to GPU 0 alongside the thinker, so its TP ranks may either share the thinker GPUs (**With thinker**, the default) or take dedicated GPUs.
+`--text-only` selects the thinker-only pipeline (no talker, no audio). Omit it for the speech pipeline, which adds a dedicated `--talker.gpu`. The talker GPU must not overlap the thinker TP placement (the only placement Ming validates), so the generator always keeps it separate. The vision encoder defaults to GPU 0 alongside the thinker, so its TP ranks may either share the thinker GPUs (**With thinker**, the default) or take dedicated GPUs.
 
 The **Hardware** toggle sets `--mem-fraction-static`:
 
@@ -83,7 +85,7 @@ This smoke command launches the default speech-capable Ming pipeline. Add `--tex
 
 ### Vision Encoder Tensor Parallelism
 
-The Ming image (vision) encoder can be sharded across GPUs with the dedicated `--image-encoder-tp-size` and `--image-encoder-gpus` flags, which mirror `--thinker-tp-size` / `--thinker-gpus`. `--image-encoder-gpus` takes one GPU id per TP rank as a comma list (`4,5`) or a JSON list (`[4, 5]`); the count must equal `--image-encoder-tp-size`. The encoder has 16 attention heads, so TP=2 and TP=4 both shard evenly. The selector above fills these in when you raise **Vision TP**. TP=1 (single GPU) is the default — sharding helps only when the vision encoder is a throughput bottleneck for image/video workloads.
+The Ming image (vision) encoder is sharded across GPUs with the same dotted spelling as the thinker: `--image_encoder.tp_size` and `--image_encoder.gpu`. `--image_encoder.gpu` takes one GPU id per TP rank as a JSON list (`"[4, 5]"`); the count must equal `--image_encoder.tp_size`. The encoder has 16 attention heads, so TP=2 and TP=4 both shard evenly. The selector above fills these in when you raise **Vision TP**. TP=1 (single GPU) is the default — sharding helps only when the vision encoder is a throughput bottleneck for image/video workloads.
 
 By default the encoder runs on GPU 0 alongside the thinker, so its TP ranks can reuse the thinker GPUs (**Vision GPUs: With thinker**) with no extra hardware, valid when Vision TP ≤ Thinker TP. Choose **Dedicated** to place the ranks on their own GPUs when the thinker GPUs are memory-bound.
 
@@ -97,7 +99,7 @@ The streaming pipeline is for audio chunks. The text-only `stream=true` path cur
 
 ### Placement and Memory Notes
 
-Use `--thinker-tp-size` to set thinker tensor parallelism and `--thinker-gpus` to choose the logical GPU ids. `--cpu-offload-gb`, `--quantization`, and `--mem-fraction-static` are forwarded to the thinker server. Use `--talker-gpu` only for the speech pipeline, and keep it separate from the thinker GPUs. Use `--image-encoder-tp-size` / `--image-encoder-gpus` for image-encoder tensor parallelism. The selector above wires all of these placements consistently.
+Use `--thinker.tp_size` to set thinker tensor parallelism and `--thinker.gpu` to choose the logical GPU ids as a JSON list. `--thinker.engine.cpu_offload_gb`, `--thinker.engine.quantization`, and the broadcast `--mem-fraction-static` are forwarded to the thinker server. Use `--talker.gpu` only for the speech pipeline, and keep it separate from the thinker GPUs. Use `--image_encoder.tp_size` / `--image_encoder.gpu` for image-encoder tensor parallelism. The selector above wires all of these placements consistently.
 
 ## Input and Output Examples
 
@@ -419,7 +421,7 @@ The streamed WAV chunks carry the same 44.1 kHz speech as the non-streaming repl
 | `video_max_pixels` | `null` | Maximum per-frame pixel budget passed to video preprocessing. |
 | `video_total_pixels` | `null` | Total pixel budget across sampled frames. |
 | `max_tokens` | `2048` | Forwarded to Ming as `max_new_tokens`. |
-| `temperature` | `1.0` | Chat-completions default. Set 0.0 for greedy deterministic examples. |
+| `temperature` | `1.0` | Thinker sampling. Set 0.0 for greedy deterministic examples. |
 | `top_p` | `1.0` | Thinker sampling. |
 | `top_k` | `-1` | Thinker sampling. |
 | `min_p` | `0.0` | Thinker sampling. |
@@ -488,6 +490,15 @@ Streaming speech is a low-concurrency UX path: it trades some throughput for muc
 
 At c=1 streaming delivers first audio ~2.2× sooner at a ~38% throughput cost. The crossover is around c≈4; past it, single-stream queuing makes streaming's first chunk arrive later than the non-streaming full response. Each streaming request emits ~20 chunks at ~19 ms intervals. The streaming measurements are from PR/local-patch evidence, not a release-wide guarantee; cite streaming as a low-concurrency first-audio win rather than a universal throughput win.
 
+### SeedTTS English Speech Results
+
+Results for the full 1,088-sample English SeedTTS split on 3× H200 (Thinker TP=2 and a dedicated Talker GPU), at concurrency 4 with voice `DB30`, temperature 0.7, seed 42, and `max_new_tokens=256`. AudioVAE uses FlashAttention-2. WER is corpus WER from Qwen3-ASR-1.7B. Each mode was measured once after four warmup requests.
+
+| Mode | Throughput (req/s) | Mean latency (s) | First audio (s) | Audio throughput (audio-s/s) | EN WER |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Non-streaming | 4.606 | 0.867 | — | 29.988 | 1.666% |
+| Streaming | 1.503 | 2.658 | 2.059 | 9.712 | 1.591% |
+
 ### Audio Equivalence
 
 A small c=1 audit (single prompt, single voice, n=4 WAVs per mode) checks that the streaming path preserves audio content versus non-streaming on the same backend.
@@ -500,9 +511,9 @@ Intelligibility is fully preserved; streaming and non-streaming are close but no
 
 ## Known Limitations
 
-- **Ming is large.** Use thinker TP and plan GPU placement deliberately. On 80 GB H100-class GPUs the MoE thinker does not fit on a single GPU, so bare default placement (no `--thinker-tp-size`) out-of-memories during startup — TP=4 is the smallest placement that loads (TP=1 and TP=2 both OOM). CPU offload can make the model fit on fewer GPUs but slows inference.
+- **Ming is large.** Use thinker TP and plan GPU placement deliberately. On 80 GB H100-class GPUs the MoE thinker does not fit on a single GPU, so bare default placement (no `--thinker.tp_size`) out-of-memories during startup — TP=4 is the smallest placement that loads (TP=1 and TP=2 both OOM). CPU offload can make the model fit on fewer GPUs but slows inference.
 - **Speech is 44.1 kHz; the chat-completions WAV header is currently mislabeled.** The talker produces 44.1 kHz audio, but the non-streaming and streaming completion paths stamp the returned WAV header at 24000 Hz — `completion()` / `completion_stream()` do not forward `chunk.sample_rate`, so `encode_audio` falls back to `DEFAULT_SAMPLE_RATE = 24000` (`sglang_omni/client/audio.py`). The samples are not resampled, so the audio is genuine 44.1 kHz — set the WAV header to `44100` when saving if your player honors it. The `/v1/audio/speech` path already forwards the rate.
-- **Image-encoder TP is set with dedicated flags.** Use `--image-encoder-tp-size` and `--image-encoder-gpus` (see [Vision Encoder Tensor Parallelism](#vision-encoder-tensor-parallelism)). The generic dotted `--stages.<i>.gpu` CLI override only accepts a single integer GPU id, so it cannot express a per-rank GPU list — use the dedicated flags instead.
+- **Image-encoder TP uses the same dotted spelling.** Use `--image_encoder.tp_size` and `--image_encoder.gpu` (see [Vision Encoder Tensor Parallelism](#vision-encoder-tensor-parallelism)); `--image_encoder.gpu` accepts a JSON list with one GPU id per TP rank.
 - **Speech output uses `/v1/chat/completions`.** Ming's omni speech path is chat-completions text + audio, not the `/v1/audio/speech` TTS endpoint used by S2-Pro, Higgs, Voxtral, and Qwen3-TTS.
 - **Streaming speech launch needs a pipeline config today.** Generic `sgl-omni serve --model-path` exposes default speech and `--text-only` directly. Streaming speech uses `MingOmniStreamingSpeechPipelineConfig`.
 - **Text streaming is not token-by-token today.** In the current Ming path, text-only `stream=true` currently emits an aggregate text chunk. Use streaming speech when you need audio chunks.

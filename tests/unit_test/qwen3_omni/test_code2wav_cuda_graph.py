@@ -1,0 +1,1328 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import torch
+
+from sglang_omni.models.qwen3_omni.components import (
+    code2wav_cuda_graph,
+    code2wav_scheduler,
+)
+from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
+    Code2WavCudaGraphRunner,
+    GraphKey,
+)
+
+DEFAULT_GRAPH_KEYS = tuple(
+    GraphKey(batch_size=1, frames=frames) for frames in (10, 20, 30, 35)
+)
+
+
+class FakeModel:
+    def __init__(self) -> None:
+        self.calls: list[torch.Tensor] = []
+
+    def __call__(self, codes: torch.Tensor) -> torch.Tensor:
+        self.calls.append(codes.detach().clone())
+        samples = int(codes.shape[-1]) * 2
+        base = codes.float().sum(dim=(1, 2), keepdim=True)
+        ramp = torch.arange(samples, dtype=torch.float32).view(1, 1, samples)
+        return base + ramp
+
+
+class FakeGraph:
+    def __init__(
+        self,
+        model: FakeModel,
+        static_input: torch.Tensor,
+        static_output: torch.Tensor,
+        *,
+        corrupt: bool,
+    ) -> None:
+        self.model = model
+        self.static_input = static_input
+        self.static_output = static_output
+        self.corrupt = corrupt
+        self.fail_replay: Exception | None = None
+        self.replay_inputs: list[torch.Tensor] = []
+
+    def replay(self) -> None:
+        if self.fail_replay is not None:
+            raise self.fail_replay
+        self.replay_inputs.append(self.static_input.clone())
+        output = self.model(self.static_input)
+        if self.corrupt:
+            output = output + 1
+        self.static_output.copy_(output)
+
+
+class FakeCudaBackend:
+    def __init__(
+        self,
+        *,
+        capture_error_at: int | None = None,
+        corrupt_at: int | None = None,
+        replay_error_at: int | None = None,
+        after_allocated: int = 160,
+        after_reserved: int = 200,
+    ) -> None:
+        self.capture_error_at = capture_error_at
+        self.corrupt_at = corrupt_at
+        self.replay_error_at = replay_error_at
+        self.capture_calls = 0
+        self.pool_calls = 0
+        self.capture_pools: list[Any] = []
+        self.new_stream_devices: list[torch.device] = []
+        self.warmup_streams: list[Any | None] = []
+        self.capture_streams: list[Any | None] = []
+        self.warmup_iterations: list[int] = []
+        self.synchronize_calls = 0
+        self.empty_cache_calls = 0
+        self.graphs: list[FakeGraph] = []
+        self.tensor_devices: dict[int, torch.device] = {}
+        self.memory_snapshots = [
+            {
+                "allocated_bytes": 100,
+                "reserved_bytes": 120,
+                "max_reserved_bytes": 130,
+                "free_bytes": 900,
+                "total_bytes": 1000,
+            },
+            {
+                "allocated_bytes": after_allocated,
+                "reserved_bytes": after_reserved,
+                "max_reserved_bytes": 250,
+                "free_bytes": 820,
+                "total_bytes": 1000,
+            },
+            {
+                "allocated_bytes": 100,
+                "reserved_bytes": 120,
+                "max_reserved_bytes": 250,
+                "free_bytes": 900,
+                "total_bytes": 1000,
+            },
+        ]
+        self.memory_index = 0
+
+    def graph_backend(self, device: torch.device) -> object:
+        del device
+        return object()
+
+    def device_context(self, device: torch.device):
+        del device
+        return nullcontext()
+
+    def memory_stats(self, device: torch.device) -> dict[str, int]:
+        del device
+        index = min(self.memory_index, len(self.memory_snapshots) - 1)
+        self.memory_index += 1
+        return dict(self.memory_snapshots[index])
+
+    def empty_cache(self, device: torch.device) -> None:
+        del device
+        self.empty_cache_calls += 1
+
+    def new_static_input(
+        self, shape: tuple[int, int, int], *, device: torch.device
+    ) -> torch.Tensor:
+        tensor = torch.zeros(shape, dtype=torch.long)
+        self.mark_cuda(tensor, device=device)
+        return tensor
+
+    def warmup(
+        self,
+        model: FakeModel,
+        static_input: torch.Tensor,
+        *,
+        iterations: int,
+        device: torch.device,
+        stream: object | None = None,
+    ) -> None:
+        del device
+        self.warmup_streams.append(stream)
+        self.warmup_iterations.append(iterations)
+        for _ in range(iterations):
+            model(static_input)
+
+    def graph_pool_handle(self, device: torch.device) -> object:
+        del device
+        self.pool_calls += 1
+        return object()
+
+    def new_stream(self, device: torch.device) -> object:
+        self.new_stream_devices.append(device)
+        return object()
+
+    def capture(
+        self,
+        model: FakeModel,
+        static_input: torch.Tensor,
+        *,
+        pool: object,
+        stream: object | None = None,
+    ) -> tuple[FakeGraph, torch.Tensor]:
+        call_index = self.capture_calls
+        self.capture_calls += 1
+        self.capture_pools.append(pool)
+        self.capture_streams.append(stream)
+        if call_index == self.capture_error_at:
+            raise torch.OutOfMemoryError("fake capture OOM")
+        static_output = model(static_input).detach().clone()
+        graph = FakeGraph(
+            model,
+            static_input,
+            static_output,
+            corrupt=call_index == self.corrupt_at,
+        )
+        if call_index == self.replay_error_at:
+            graph.fail_replay = RuntimeError("fake build replay failed")
+        self.graphs.append(graph)
+        return graph, static_output
+
+    def synchronize(self, device: torch.device) -> None:
+        del device
+        self.synchronize_calls += 1
+
+    def is_accelerator_tensor(self, tensor: torch.Tensor, device: torch.device) -> bool:
+        marked = self.tensor_devices.get(id(tensor))
+        return marked is not None and marked.type == device.type
+
+    def tensor_device_matches(self, tensor: torch.Tensor, device: torch.device) -> bool:
+        return self.tensor_devices.get(id(tensor)) == device
+
+    def mark_cuda(
+        self, tensor: torch.Tensor, *, device: str | torch.device = "cuda:0"
+    ) -> torch.Tensor:
+        self.tensor_devices[id(tensor)] = torch.device(device)
+        return tensor
+
+
+def build_runner(
+    *,
+    backend: FakeCudaBackend | None = None,
+    model: FakeModel | None = None,
+    total_gpu_memory_fraction: float | None = 0.5,
+) -> tuple[Code2WavCudaGraphRunner, FakeCudaBackend, FakeModel]:
+    backend = backend or FakeCudaBackend()
+    model = model or FakeModel()
+    runner = Code2WavCudaGraphRunner.build(
+        model,
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        graph_keys=DEFAULT_GRAPH_KEYS,
+        model_footprint_bytes=100,
+        decode_stream=None,
+        device_api=backend,
+    )
+    return runner, backend, model
+
+
+def make_codes(
+    backend: FakeCudaBackend,
+    batch_size: int,
+    frames: int,
+    *,
+    num_quantizers: int = 16,
+    dtype: torch.dtype = torch.long,
+    device: str = "cuda:0",
+) -> torch.Tensor:
+    tensor = torch.arange(
+        batch_size * num_quantizers * frames,
+        dtype=dtype,
+    ).reshape(batch_size, num_quantizers, frames)
+    return backend.mark_cuda(tensor, device=device)
+
+
+def test_build_uses_two_warmups_one_private_pool_and_atomic_publication() -> None:
+    runner, backend, model = build_runner()
+
+    assert backend.warmup_iterations == [2] * 4
+    assert [tuple(graph.static_input.shape) for graph in backend.graphs] == [
+        (1, 16, 35),
+        (1, 16, 30),
+        (1, 16, 20),
+        (1, 16, 10),
+    ]
+    assert backend.pool_calls == 1
+    assert len({id(pool) for pool in backend.capture_pools}) == 1
+    assert backend.synchronize_calls >= 1
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["graph_contract"]["keys"] == [
+        {"batch_size": key.batch_size, "frames": key.frames, "decode": "window"}
+        for key in DEFAULT_GRAPH_KEYS
+    ]
+    assert stats["build"]["published_graph_count"] == 4
+    assert stats["memory"] == {
+        "total_gpu_memory_fraction": 0.5,
+        "stage_budget_bytes": 500,
+        "loaded_model_footprint_bytes": 100,
+        "graph_budget_bytes": 400,
+        "graph_footprint_bytes": 80,
+        "before": {
+            "allocated_bytes": 100,
+            "reserved_bytes": 120,
+            "max_reserved_bytes": 130,
+            "free_bytes": 900,
+            "total_bytes": 1000,
+        },
+        "after": {
+            "allocated_bytes": 160,
+            "reserved_bytes": 200,
+            "max_reserved_bytes": 250,
+            "free_bytes": 820,
+            "total_bytes": 1000,
+        },
+    }
+
+
+def test_build_reuses_one_private_stream_for_all_warmups_and_captures() -> None:
+    runner, backend, model = build_runner()
+
+    assert runner.stats()["enabled"] is True
+    assert backend.new_stream_devices == [torch.device("cuda:0")]
+    assert len(backend.warmup_streams) == 4
+    assert len(backend.capture_streams) == 4
+    private_stream = backend.warmup_streams[0]
+    assert private_stream is not None
+    assert all(stream is private_stream for stream in backend.warmup_streams)
+    assert all(stream is private_stream for stream in backend.capture_streams)
+
+
+def test_build_warms_up_and_captures_on_the_decode_stream() -> None:
+    decode_stream = object()
+    backend = FakeCudaBackend()
+    runner = Code2WavCudaGraphRunner.build(
+        FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=DEFAULT_GRAPH_KEYS,
+        model_footprint_bytes=100,
+        decode_stream=decode_stream,
+        device_api=backend,
+    )
+
+    assert runner.stats()["enabled"] is True
+    assert backend.new_stream_devices == []
+    assert len(backend.capture_streams) == len(DEFAULT_GRAPH_KEYS)
+    assert all(stream is decode_stream for stream in backend.warmup_streams)
+    assert all(stream is decode_stream for stream in backend.capture_streams)
+
+
+def test_all_serving_keys_hit_while_batch_two_misses() -> None:
+    runner, backend, model = build_runner()
+
+    for key in DEFAULT_GRAPH_KEYS:
+        result = runner.run(make_codes(backend, key.batch_size, key.frames))
+        assert result.execution_mode == "cuda_graph"
+        assert result.key == key
+        assert result.fallback_reason is None
+
+    calls_before = len(model.calls)
+    missed = runner.run(make_codes(backend, 2, 10))
+
+    assert missed.execution_mode == "eager"
+    assert missed.key == GraphKey(batch_size=2, frames=10)
+    assert missed.fallback_reason == "key_miss"
+    assert len(model.calls) == calls_before + 1
+    assert runner.stats()["runtime"] == {
+        "graph_replays": 4,
+        "replay_failures": 0,
+        "fallback_counts": {"key_miss": 1},
+    }
+
+
+def test_device_api_restores_original_stream_when_capture_exit_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni import platforms
+
+    original_stream = object()
+    current = {"stream": original_stream}
+
+    class SideStream:
+        def wait_stream(self, stream: object) -> None:
+            assert stream is original_stream
+
+    side_stream = SideStream()
+
+    class FailingCaptureContext:
+        def __enter__(self) -> None:
+            current["stream"] = side_stream
+
+        def __exit__(self, *args: object) -> None:
+            raise RuntimeError("fake capture_end failed")
+
+    def capture(**kwargs: object) -> FailingCaptureContext:
+        assert kwargs["stream"] is side_stream
+        assert kwargs["thread_local_errors"] is True
+        return FailingCaptureContext()
+
+    fake_module = SimpleNamespace(
+        __name__="fake",
+        current_stream=lambda _device: current["stream"],
+        set_stream=lambda stream: current.update(stream=stream),
+    )
+    monkeypatch.setattr(
+        code2wav_cuda_graph.torch,
+        "get_device_module",
+        lambda *args, **_kwargs: fake_module,
+    )
+    monkeypatch.setattr(
+        platforms.current_platform,
+        "get_device_graph_backend",
+        lambda _device: SimpleNamespace(capture=capture),
+    )
+
+    with pytest.raises(RuntimeError, match="fake capture_end failed"):
+        code2wav_cuda_graph.TorchDeviceApi().capture(
+            FakeModel(),
+            torch.zeros((1, 16, 10), dtype=torch.long),
+            pool=object(),
+            stream=side_stream,
+        )
+
+    assert current["stream"] is original_stream
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_real_cuda_invalid_capture_preserves_current_stream() -> None:
+    api = code2wav_cuda_graph.TorchDeviceApi()
+    device = torch.device("cuda", torch.cuda.current_device())
+    original_stream = torch.cuda.current_stream(device)
+    side_stream = api.new_stream(device)
+    static_input = torch.zeros((1, 16, 10), dtype=torch.long, device=device)
+
+    def invalidate_capture(codes: torch.Tensor) -> torch.Tensor:
+        # Host synchronization is prohibited during graph capture. This marks
+        # the capture invalid so capture_end itself exercises the failure path
+        # that used to skip the graph context's normal stream restoration.
+        torch.cuda.synchronize(device)
+        return codes
+
+    current_after: torch.cuda.Stream | None = None
+    try:
+        with pytest.raises(RuntimeError, match="(?i)captur"):
+            api.capture(
+                invalidate_capture,
+                static_input,
+                pool=torch.cuda.graph_pool_handle(),
+                stream=side_stream,
+            )
+        current_after = torch.cuda.current_stream(device)
+    finally:
+        torch.cuda.set_stream(original_stream)
+
+    assert current_after == original_stream
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_real_cuda_shared_pool_replays_batch_sizes_with_eager_parity() -> None:
+    class TinyCode2WavModel(torch.nn.Module):
+        def forward(self, codes: torch.Tensor) -> torch.Tensor:
+            return (codes.float() * 2).sum(dim=1, keepdim=True)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = TinyCode2WavModel().to(device).eval()
+    graph_keys = (
+        GraphKey(batch_size=1, frames=10),
+        GraphKey(batch_size=2, frames=10),
+    )
+    runner = Code2WavCudaGraphRunner.build(
+        model,
+        device=device,
+        num_quantizers=2,
+        total_gpu_memory_fraction=1.0,
+        graph_keys=graph_keys,
+        model_footprint_bytes=0,
+        decode_stream=None,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == len(graph_keys)
+
+    for replay_index, key in enumerate((*graph_keys, *graph_keys)):
+        codes = (
+            torch.arange(
+                key.batch_size * 2 * key.frames,
+                dtype=torch.long,
+                device=device,
+            ).reshape(key.batch_size, 2, key.frames)
+            + replay_index * 1000
+        )
+        with torch.inference_mode():
+            eager = model(codes).clone()
+        result = runner.run(codes)
+        graph_output = result.output.clone()
+
+        assert result.execution_mode == "cuda_graph"
+        assert result.key == key
+        assert torch.equal(graph_output, eager)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_real_cuda_output_overlap_pipeline_matches_sync_bitwise() -> None:
+    """Real graph replay + the depth-2 pipelined D2H produce the exact bytes
+    of the synchronous path, including the pending flush at stream-done."""
+    from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
+        Code2WavScheduler,
+    )
+    from sglang_omni.pipeline.stage.stream_queue import StreamItem
+    from tests.unit_test.fixtures.qwen_fakes import (
+        deliver_code2wav_chunk,
+        make_qwen_payload,
+    )
+
+    class TinyCode2WavModel(torch.nn.Module):
+        total_upsample = 1
+
+        def forward(self, codes: torch.Tensor) -> torch.Tensor:
+            return (codes.float() * 2).sum(dim=1, keepdim=True)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    def run(*, overlap: bool) -> list[tuple]:
+        model = TinyCode2WavModel().to(device).eval()
+        runner = Code2WavCudaGraphRunner.build(
+            model,
+            device=device,
+            num_quantizers=2,
+            total_gpu_memory_fraction=1.0,
+            graph_keys=DEFAULT_GRAPH_KEYS,
+            model_footprint_bytes=0,
+            decode_stream=None,
+        )
+        scheduler = Code2WavScheduler(
+            model,
+            device=str(device),
+            stream_chunk_size=10,
+            left_context_size=25,
+            enable_output_overlap=overlap,
+            enable_cuda_graph=True,
+            cuda_graph_runner=runner,
+        )
+        assert scheduler.pipeline_active is overlap
+        scheduler.stream_payloads["req-1"] = make_qwen_payload(request_id="req-1")
+        scheduler.get_or_create_stream_state("req-1")
+        for i in range(21):
+            deliver_code2wav_chunk(
+                scheduler,
+                "req-1",
+                StreamItem(
+                    i,
+                    torch.tensor([i % 7 + 1, 10]),
+                    "talker",
+                    metadata={"stream": True},
+                ),
+            )
+        scheduler.handle_stream_done("req-1")
+        messages = [
+            scheduler.outbox.get_nowait() for _ in range(scheduler.outbox.qsize())
+        ]
+        snapshot: list[tuple] = []
+        for message in messages:
+            if message.type == "stream":
+                snapshot.append(
+                    (message.type, message.data["audio_waveform"], message.metadata)
+                )
+            else:
+                snapshot.append((message.type, message.data.data))
+        stats = runner.stats()
+        assert stats["runtime"]["graph_replays"] >= 2
+        return snapshot
+
+    overlap_snapshot = run(overlap=True)
+    sync_snapshot = run(overlap=False)
+    assert overlap_snapshot == sync_snapshot
+    assert [item[0] for item in overlap_snapshot] == [
+        "stream",
+        "stream",
+        "stream",
+        "result",
+    ]
+
+
+def test_run_copies_live_input_replays_and_returns_borrowed_output_metadata() -> None:
+    runner, backend, model = build_runner()
+    graph = next(
+        graph
+        for graph in backend.graphs
+        if tuple(graph.static_input.shape) == (1, 16, 10)
+    )
+    first_codes = make_codes(backend, 1, 10)
+
+    first = runner.run(first_codes)
+    first_snapshot = first.output.clone()
+
+    assert first.execution_mode == "cuda_graph"
+    assert first.key == GraphKey(batch_size=1, frames=10)
+    assert first.fallback_reason is None
+    assert first.output is graph.static_output
+    assert torch.equal(graph.replay_inputs[-1], first_codes)
+
+    second_codes = make_codes(backend, 1, 10) + 7
+    backend.mark_cuda(second_codes)
+    second = runner.run(second_codes)
+
+    assert second.output is first.output
+    assert not torch.equal(first.output, first_snapshot)
+    assert torch.equal(graph.replay_inputs[-1], second_codes)
+    assert runner.stats()["runtime"]["graph_replays"] == 2
+
+
+@pytest.mark.parametrize(
+    ("runner_state", "eligible", "batch_size", "expected_reason"),
+    [
+        ("disabled", True, 1, "disabled"),
+        ("enabled", False, 1, "ineligible"),
+        ("enabled", True, 2, "key_miss"),
+    ],
+)
+def test_intentional_eager_fallbacks(
+    runner_state: str,
+    eligible: bool,
+    batch_size: int,
+    expected_reason: str,
+) -> None:
+    fraction = None if runner_state == "disabled" else 0.5
+    runner, backend, model = build_runner(total_gpu_memory_fraction=fraction)
+    codes = make_codes(backend, batch_size, 10)
+
+    calls_before = len(model.calls)
+    result = runner.run(codes, eligible=eligible)
+
+    assert result.execution_mode == "eager"
+    assert result.fallback_reason == expected_reason
+    assert len(model.calls) == calls_before + 1
+    assert runner.stats()["runtime"]["fallback_counts"] == {expected_reason: 1}
+    if expected_reason == "key_miss":
+        assert result.key == GraphKey(batch_size=batch_size, frames=10)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error", "message"),
+    [
+        ("non_cuda", TypeError, "must be on device type 'cuda'"),
+        ("wrong_dtype", TypeError, "torch.long"),
+        ("wrong_device", ValueError, "cuda:0"),
+        ("wrong_shape", ValueError, "shape"),
+        ("wrong_num_quantizers", ValueError, "16 quantizers"),
+    ],
+)
+def test_eligible_input_contract_violations_raise(
+    case: str,
+    expected_error: type[Exception],
+    message: str,
+) -> None:
+    runner, backend, model = build_runner()
+    if case == "non_cuda":
+        codes = torch.zeros((1, 16, 10), dtype=torch.long)
+    elif case == "wrong_dtype":
+        codes = make_codes(backend, 1, 10, dtype=torch.int32)
+    elif case == "wrong_device":
+        codes = make_codes(backend, 1, 10, device="cuda:1")
+    elif case == "wrong_shape":
+        codes = backend.mark_cuda(torch.zeros((16, 10), dtype=torch.long))
+    else:
+        codes = make_codes(backend, 1, 10, num_quantizers=15)
+    calls_before = len(model.calls)
+
+    with pytest.raises(expected_error, match=message):
+        runner.run(codes)
+
+    assert len(model.calls) == calls_before
+    assert runner.stats()["runtime"]["fallback_counts"] == {}
+
+
+@pytest.mark.parametrize(
+    ("runner_state", "eligible"),
+    [
+        ("enabled", True),
+        ("ineligible", False),
+        ("disabled", True),
+    ],
+)
+def test_pid_mismatch_fails_closed_before_any_eager_model_call(
+    runner_state: str,
+    eligible: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fraction = None if runner_state == "disabled" else 0.5
+    runner, backend, model = build_runner(total_gpu_memory_fraction=fraction)
+    calls_before = len(model.calls)
+    monkeypatch.setattr(
+        code2wav_cuda_graph.os,
+        "getpid",
+        lambda: runner.stats()["binding"]["owner_pid"] + 1,
+    )
+
+    with pytest.raises(RuntimeError, match="must be rebuilt in a spawned process"):
+        runner.run(make_codes(backend, 1, 10), eligible=eligible)
+
+    assert len(model.calls) == calls_before
+    runtime = runner.stats()["runtime"]
+    assert runtime["fallback_counts"] == {}
+    json.dumps(runner.stats(), allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("backend_factory", "fraction", "reason_prefix"),
+    [
+        (lambda: FakeCudaBackend(capture_error_at=3), 0.5, "capture_failed"),
+        (lambda: FakeCudaBackend(replay_error_at=3), 0.5, "capture_failed"),
+        (lambda: FakeCudaBackend(corrupt_at=3), 0.5, "equivalence_failed"),
+        (lambda: FakeCudaBackend(), 0.15, "memory_budget_exceeded"),
+    ],
+)
+def test_any_build_failure_rolls_back_every_graph(
+    backend_factory: Callable[[], FakeCudaBackend],
+    fraction: float,
+    reason_prefix: str,
+) -> None:
+    backend = backend_factory()
+    runner, backend, model = build_runner(
+        backend=backend,
+        total_gpu_memory_fraction=fraction,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is False
+    assert stats["build"]["published_graph_count"] == 0
+    assert stats["disable_reason"].startswith(reason_prefix)
+    assert backend.empty_cache_calls >= 1
+    memory = stats["memory"]
+    assert memory["after"]["allocated_bytes"] == 160
+    assert memory["after_rollback"]["allocated_bytes"] == 100
+
+
+@pytest.mark.parametrize("fraction", [None, 0.0, 1.01, float("nan")])
+def test_memory_fraction_must_be_explicit_and_in_range(
+    fraction: float | None,
+) -> None:
+    runner, backend, model = build_runner(
+        total_gpu_memory_fraction=fraction,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is False
+    assert stats["build"]["published_graph_count"] == 0
+    assert stats["disable_reason"] == "invalid_total_gpu_memory_fraction"
+
+
+def test_runtime_replay_failure_is_raised_and_disables_all_graphs() -> None:
+    runner, backend, model = build_runner()
+    build_stats = runner.stats()["build"]
+    graph = next(
+        graph
+        for graph in backend.graphs
+        if tuple(graph.static_input.shape) == (1, 16, 10)
+    )
+    graph.fail_replay = RuntimeError("replay exploded")
+
+    with pytest.raises(RuntimeError, match="replay exploded"):
+        runner.run(make_codes(backend, 1, 10))
+
+    stats = runner.stats()
+    assert stats["enabled"] is False
+    assert stats["disable_reason"] == (
+        "runtime_replay_failed: RuntimeError: replay exploded"
+    )
+    assert stats["build"] == build_stats
+    assert stats["runtime"]["replay_failures"] == 1
+
+    calls_before = len(model.calls)
+    fallback = runner.run(make_codes(backend, 1, 10))
+    assert fallback.execution_mode == "eager"
+    assert fallback.fallback_reason == "disabled"
+    assert len(model.calls) == calls_before + 1
+
+
+def test_stats_are_strictly_json_safe_after_success_and_failure() -> None:
+    successful, successful_backend, model = build_runner()
+    successful.run(make_codes(successful_backend, 3, 10))
+    failed, failed_backend, model = build_runner(backend=FakeCudaBackend(corrupt_at=0))
+
+    json.dumps(successful.stats(), allow_nan=False)
+    json.dumps(failed.stats(), allow_nan=False)
+
+
+TIERED_GRAPH_KEYS = (
+    GraphKey(batch_size=1, frames=10),
+    GraphKey(batch_size=1, frames=20),
+    GraphKey(batch_size=2, frames=10),
+    GraphKey(batch_size=2, frames=20),
+    GraphKey(batch_size=4, frames=10),
+    GraphKey(batch_size=4, frames=20),
+)
+
+
+class SequencedBackend(FakeCudaBackend):
+    """Fake backend with an explicit memory-snapshot schedule and optional
+    per-capture-index errors, for driving the tiered budget logic."""
+
+    def __init__(
+        self,
+        *,
+        snapshots: list[tuple[int, int]],
+        errors_at: dict[int, Exception] | None = None,
+    ) -> None:
+        super().__init__()
+        self.memory_snapshots = [
+            {
+                "allocated_bytes": allocated,
+                "reserved_bytes": reserved,
+                "max_reserved_bytes": reserved,
+                "free_bytes": 1000 - allocated,
+                "total_bytes": 1000,
+            }
+            for allocated, reserved in snapshots
+        ]
+        self.errors_at = errors_at or {}
+
+    def capture(self, model, static_input, *, pool, stream=None):
+        error = self.errors_at.get(self.capture_calls)
+        if error is not None:
+            self.capture_calls += 1
+            self.capture_pools.append(pool)
+            raise error
+        return super().capture(model, static_input, pool=pool, stream=stream)
+
+
+def build_tiered_runner(
+    backend: SequencedBackend,
+) -> Code2WavCudaGraphRunner:
+    return Code2WavCudaGraphRunner.build(
+        FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=TIERED_GRAPH_KEYS,
+        model_footprint_bytes=100,
+        decode_stream=None,
+        device_api=backend,
+    )
+
+
+def test_process_allocation_above_the_stage_budget_still_captures() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (900, 950),  # before: another stage in the process holds 800
+            (960, 1010),  # after the serial keys
+        ],
+    )
+    runner = Code2WavCudaGraphRunner.build(
+        FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=DEFAULT_GRAPH_KEYS,
+        model_footprint_bytes=100,
+        decode_stream=None,
+        device_api=backend,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == len(DEFAULT_GRAPH_KEYS)
+    assert stats["memory"]["stage_budget_bytes"] == 500
+    assert stats["memory"]["loaded_model_footprint_bytes"] == 100
+    assert stats["memory"]["graph_budget_bytes"] == 400
+    assert stats["memory"]["graph_footprint_bytes"] == 60
+
+
+def test_tier1_publishes_full_matrix_within_budget() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt baseline
+            (300, 340),  # after b4t20
+            (360, 400),  # after b4t10
+            (390, 430),  # after b2t20
+            (400, 440),  # after b2t10
+            (420, 460),  # final combined footprint
+        ],
+    )
+    runner = build_tiered_runner(backend)
+
+    assert [tuple(graph.static_input.shape) for graph in backend.graphs] == [
+        (4, 16, 20),
+        (4, 16, 10),
+        (2, 16, 20),
+        (2, 16, 10),
+        (1, 16, 20),
+        (1, 16, 10),
+    ]
+    assert backend.pool_calls == 1
+    assert len({id(pool) for pool in backend.capture_pools}) == 1
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == 6
+    tier1 = stats["memory"]["tier1"]
+    assert tier1["attempts"] == 1
+    assert tier1["published_key_count"] == 4
+    assert tier1["skipped_keys"] == []
+    assert runner.available_batch_sizes(10) == (4, 2, 1)
+    assert runner.available_batch_sizes(20) == (4, 2, 1)
+    assert runner.available_batch_sizes(99) == ()
+
+    result = runner.run(make_codes(backend, 4, 20))
+    assert result.execution_mode == "cuda_graph"
+    assert result.key == GraphKey(batch_size=4, frames=20)
+    json.dumps(stats, allow_nan=False)
+
+
+def test_tier1_budget_violation_republishes_greedy_prefix() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt 1 baseline
+            (300, 340),  # after b4t20
+            (400, 440),  # after b4t10
+            (560, 600),  # b2t20 pushes footprint past the 400 budget
+            (100, 120),  # attempt 2 baseline
+            (300, 340),  # after b4t20
+            (400, 440),  # after b4t10
+            (420, 460),  # final combined footprint
+        ],
+    )
+    runner = build_tiered_runner(backend)
+
+    stats = runner.stats()
+    tier1 = stats["memory"]["tier1"]
+    assert tier1["attempts"] == 2
+    assert tier1["published_key_count"] == 2
+    assert tier1["skipped_keys"] == [
+        {"batch_size": 2, "frames": 10, "decode": "window"},
+        {"batch_size": 2, "frames": 20, "decode": "window"},
+    ]
+    assert backend.pool_calls == 2
+    assert runner.available_batch_sizes(20) == (4, 1)
+    assert runner.available_batch_sizes(10) == (4, 1)
+    assert stats["build"]["published_graph_count"] == 4
+
+    hit = runner.run(make_codes(backend, 4, 20))
+    assert hit.execution_mode == "cuda_graph"
+    miss = runner.run(make_codes(backend, 2, 20))
+    assert miss.execution_mode == "eager"
+    assert miss.fallback_reason == "key_miss"
+
+
+def test_tier1_oversized_first_key_drops_its_batch_class() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt 1 baseline
+            (700, 740),  # b4t20 alone exceeds the budget
+            (100, 120),  # attempt 2 baseline
+            (260, 300),  # after b2t20
+            (300, 340),  # after b2t10
+            (320, 360),  # final combined footprint
+        ],
+    )
+    runner = build_tiered_runner(backend)
+
+    tier1 = runner.stats()["memory"]["tier1"]
+    assert tier1["attempts"] == 2
+    assert tier1["published_key_count"] == 2
+    assert tier1["skipped_keys"] == [
+        {"batch_size": 4, "frames": 10, "decode": "window"},
+        {"batch_size": 4, "frames": 20, "decode": "window"},
+    ]
+    assert runner.available_batch_sizes(20) == (2, 1)
+
+
+def test_combined_footprint_violation_drops_largest_batch_class() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt 1 baseline
+            (300, 340),  # after b4t20
+            (360, 400),  # after b4t10
+            (390, 430),  # after b2t20
+            (400, 440),  # after b2t10
+            (520, 560),  # tier 0 pushes the combined footprint past 400
+            (100, 120),  # attempt 2 baseline
+            (260, 300),  # after b2t20
+            (300, 340),  # after b2t10
+            (320, 360),  # final combined footprint
+        ],
+    )
+    runner = build_tiered_runner(backend)
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == 4
+    assert stats["memory"]["graph_footprint_bytes"] == 240
+    tier1 = stats["memory"]["tier1"]
+    assert tier1["attempts"] == 2
+    assert tier1["published_key_count"] == 2
+    assert tier1["skipped_keys"] == [
+        {"batch_size": 4, "frames": 10, "decode": "window"},
+        {"batch_size": 4, "frames": 20, "decode": "window"},
+    ]
+    assert backend.pool_calls == 2
+    assert runner.available_batch_sizes(20) == (2, 1)
+
+
+def test_tier1_capture_oom_drops_the_batch_class_and_retries() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt 1 baseline
+            (100, 120),  # attempt 2 baseline
+            (260, 300),  # after b2t20
+            (300, 340),  # after b2t10
+            (320, 360),  # final combined footprint
+        ],
+        errors_at={0: torch.OutOfMemoryError("fake tier1 capture OOM")},
+    )
+    runner = build_tiered_runner(backend)
+
+    tier1 = runner.stats()["memory"]["tier1"]
+    assert tier1["attempts"] == 2
+    assert tier1["published_key_count"] == 2
+    assert tier1["disable_reason"] is None
+    assert runner.available_batch_sizes(20) == (2, 1)
+    assert backend.empty_cache_calls >= 2
+
+
+def test_tier1_capture_error_abandons_tier_but_keeps_tier0() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt 1 baseline
+            (160, 200),  # tier0-only final combined footprint
+        ],
+        errors_at={0: RuntimeError("fake capture explosion")},
+    )
+    runner = build_tiered_runner(backend)
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == 2
+    tier1 = stats["memory"]["tier1"]
+    assert tier1["attempts"] == 1
+    assert tier1["published_key_count"] == 0
+    assert tier1["disable_reason"].startswith("capture_failed: RuntimeError")
+    assert len(tier1["skipped_keys"]) == 4
+
+    tier0_hit = runner.run(make_codes(backend, 1, 10))
+    assert tier0_hit.execution_mode == "cuda_graph"
+    tier1_miss = runner.run(make_codes(backend, 2, 10))
+    assert tier1_miss.execution_mode == "eager"
+    assert tier1_miss.fallback_reason == "key_miss"
+    json.dumps(stats, allow_nan=False)
+
+
+def test_tier1_equivalence_failure_abandons_tier_with_original_reason() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt 1 baseline
+            (160, 200),  # tier0-only final combined footprint
+        ],
+    )
+    backend.corrupt_at = 0
+    runner = build_tiered_runner(backend)
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == 2
+    assert stats["memory"]["tier1"]["disable_reason"].startswith("equivalence_failed")
+
+
+def test_failing_best_effort_single_request_key_keeps_the_atomic_tier() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),
+            (100, 120),
+            (160, 200),
+        ],
+    )
+    backend.corrupt_at = 0
+    runner = Code2WavCudaGraphRunner.build(
+        FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=DEFAULT_GRAPH_KEYS,
+        best_effort_keys=(
+            GraphKey(batch_size=1, frames=27),
+            GraphKey(batch_size=1, frames=26),
+        ),
+        model_footprint_bytes=100,
+        decode_stream=None,
+        device_api=backend,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == len(DEFAULT_GRAPH_KEYS)
+    assert stats["memory"]["tier1"]["disable_reason"].startswith("equivalence_failed")
+    assert runner.run(make_codes(backend, 1, 30)).execution_mode == "cuda_graph"
+    tail = runner.run(make_codes(backend, 1, 27))
+    assert tail.execution_mode == "eager"
+    assert tail.fallback_reason == "key_miss"
+
+
+class PoolGrowthBackend(FakeCudaBackend):
+    """Fake backend whose fresh pool grows per captured graph, past the whole
+    graph budget for graphs of oversized_rows rows or more."""
+
+    def __init__(self, *, oversized_rows: int) -> None:
+        super().__init__()
+        self.oversized_rows = oversized_rows
+        self.pool_bytes = 0
+
+    def memory_stats(self, device: torch.device) -> dict[str, int]:
+        del device
+        return {
+            "allocated_bytes": 100 + self.pool_bytes,
+            "reserved_bytes": 120 + self.pool_bytes,
+            "max_reserved_bytes": 120 + self.pool_bytes,
+            "free_bytes": 900 - self.pool_bytes,
+            "total_bytes": 1000,
+        }
+
+    def graph_pool_handle(self, device: torch.device) -> object:
+        self.pool_bytes = 0
+        return super().graph_pool_handle(device)
+
+    def capture(self, model, static_input, *, pool, stream=None):
+        rows = int(static_input.shape[0])
+        self.pool_bytes += 500 if rows >= self.oversized_rows else 5
+        return super().capture(model, static_input, pool=pool, stream=stream)
+
+
+def test_capacity_shrinks_reach_every_row_count_of_the_default_ladder() -> None:
+    backend = PoolGrowthBackend(oversized_rows=3)
+    graph_keys = code2wav_scheduler.window_graph_keys(10, 25, 8)
+    final_keys = tuple(
+        GraphKey(batch_size=1, frames=frames)
+        for frames in range(1, 36)
+        if frames not in (10, 20, 30, 35)
+    )
+    runner = Code2WavCudaGraphRunner.build(
+        FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=graph_keys,
+        best_effort_keys=final_keys,
+        model_footprint_bytes=100,
+        decode_stream=None,
+        device_api=backend,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    # eight rows down to three each fail their first capture; the seventh attempt fits
+    assert stats["memory"]["tier1"]["attempts"] == 7
+    assert runner.available_batch_sizes(35) == (2, 1)
+    assert all(runner.available_batch_sizes(key.frames) == (1,) for key in final_keys)
+    assert runner.run(make_codes(backend, 2, 35)).execution_mode == "cuda_graph"
+
+
+def test_runtime_disable_clears_tier1_availability() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (100, 120),  # before
+            (100, 120),  # attempt baseline
+            (300, 340),  # after b4t20
+            (360, 400),  # after b4t10
+            (390, 430),  # after b2t20
+            (400, 440),  # after b2t10
+            (420, 460),  # final combined footprint
+        ],
+    )
+    runner = build_tiered_runner(backend)
+    assert runner.available_batch_sizes(10) == (4, 2, 1)
+    graph = next(
+        g for g in backend.graphs if tuple(g.static_input.shape) == (4, 16, 10)
+    )
+    graph.fail_replay = RuntimeError("replay exploded")
+
+    with pytest.raises(RuntimeError, match="replay exploded"):
+        runner.run(make_codes(backend, 4, 10))
+
+    assert runner.available_batch_sizes(10) == ()
+    assert runner.stats()["enabled"] is False
+
+
+def test_the_mask_pin_refuses_a_concurrent_holder() -> None:
+    import threading
+
+    held = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+
+    def holder() -> None:
+        with code2wav_cuda_graph.unpacked_sequence_mask():
+            held.set()
+            release.wait(timeout=5)
+
+    worker = threading.Thread(target=holder)
+    worker.start()
+    try:
+        assert held.wait(timeout=5), "holder never acquired the pin"
+        try:
+            with code2wav_cuda_graph.unpacked_sequence_mask():
+                outcome.append("acquired")
+        except RuntimeError:
+            outcome.append("refused")
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    assert outcome == ["refused"]
+    with code2wav_cuda_graph.unpacked_sequence_mask():
+        pass
+
+
+def test_a_failure_reading_the_mask_global_does_not_leak_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transformers import masking_utils
+
+    monkeypatch.delattr(masking_utils, "find_packed_sequence_indices")
+
+    with pytest.raises(AttributeError):
+        with code2wav_cuda_graph.unpacked_sequence_mask():
+            pass
+
+    monkeypatch.undo()
+    with code2wav_cuda_graph.unpacked_sequence_mask():
+        assert masking_utils.find_packed_sequence_indices([1, 2]) is None
+
+
+def test_a_device_whose_platform_names_no_graph_backend_is_refused_at_build() -> None:
+
+    class NoBackend(FakeCudaBackend):
+        def graph_backend(self, device: torch.device) -> None:
+            del device
+            return None
+
+    with pytest.raises(ValueError, match="names no device graph backend"):
+        Code2WavCudaGraphRunner.build(
+            FakeModel(),
+            device="cuda:0",
+            num_quantizers=16,
+            total_gpu_memory_fraction=0.5,
+            graph_keys=DEFAULT_GRAPH_KEYS,
+            device_api=NoBackend(),
+            model_footprint_bytes=100,
+            decode_stream=None,
+        )
+
+
+def test_an_indexless_device_is_refused_at_build() -> None:
+    with pytest.raises(ValueError, match="concrete device"):
+        Code2WavCudaGraphRunner.build(
+            FakeModel(),
+            device="cuda",
+            num_quantizers=16,
+            total_gpu_memory_fraction=0.5,
+            graph_keys=DEFAULT_GRAPH_KEYS,
+            device_api=FakeCudaBackend(),
+            model_footprint_bytes=100,
+            decode_stream=None,
+        )
+
+
+class PhaseRecordingBackend(FakeCudaBackend):
+
+    def __init__(self, phase: list[str]) -> None:
+        super().__init__()
+        self.phase = phase
+
+    def warmup(self, model, static_input, **kwargs):
+        parent = super().warmup
+        return self.during("warmup", lambda: parent(model, static_input, **kwargs))
+
+    def capture(self, model, static_input, **kwargs):
+        parent = super().capture
+        graph, output = self.during(
+            "capture", lambda: parent(model, static_input, **kwargs)
+        )
+        inner_replay = graph.replay
+        graph.replay = lambda: self.during("replay", inner_replay)
+        return graph, output
+
+    def during(self, phase: str, call):
+        previous, self.phase[0] = self.phase[0], phase
+        try:
+            return call()
+        finally:
+            self.phase[0] = previous
+
+
+@pytest.mark.parametrize("is_xpu", [False, True], ids=["non_xpu", "xpu"])
+def test_capture_pins_cover_warmup_capture_and_the_equivalence_check(
+    monkeypatch: pytest.MonkeyPatch, is_xpu: bool
+) -> None:
+    """_verify_equivalence compares with torch.equal, so an eager reference taken
+    outside the pins can reject a good capture and disable the runner."""
+    from transformers import masking_utils
+
+    from sglang_omni import platforms
+
+    events: list[str] = []
+    phase = ["eager"]
+
+    @contextmanager
+    def recording_pin():
+        events.append("pin_enter")
+        try:
+            yield
+        finally:
+            events.append("pin_exit")
+
+    monkeypatch.setattr(platforms.current_platform, "is_xpu", lambda: is_xpu)
+    monkeypatch.setattr(
+        platforms.current_platform, "graph_capture_attention", recording_pin
+    )
+    original_probe = masking_utils.find_packed_sequence_indices
+    seen_probe: list[object] = []
+    model = FakeModel()
+
+    def recording_model(codes: torch.Tensor) -> torch.Tensor:
+        events.append(phase[0])
+        seen_probe.append(masking_utils.find_packed_sequence_indices)
+        return model(codes)
+
+    runner = Code2WavCudaGraphRunner.build(
+        recording_model,
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=(GraphKey(batch_size=1, frames=10),),
+        device_api=PhaseRecordingBackend(phase),
+        model_footprint_bytes=100,
+        decode_stream=None,
+    )
+
+    assert runner.stats()["build"]["published_graph_count"] == 1
+    inner = ["warmup"] * 2 + ["capture", "eager", "replay"]
+    if is_xpu:
+        assert events == ["pin_enter", *inner, "pin_exit"]
+        assert all(probe is not original_probe for probe in seen_probe)
+    else:
+        assert events == inner, "no pin may be entered off XPU"
+        assert all(probe is original_probe for probe in seen_probe)
+    assert masking_utils.find_packed_sequence_indices is original_probe

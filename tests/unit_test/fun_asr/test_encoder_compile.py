@@ -14,7 +14,7 @@ from sglang_omni.models.fun_asr.sglang_model import (
 )
 
 
-def _tiny_model() -> SimpleNamespace:
+def tiny_model() -> SimpleNamespace:
     encoder = FunAsrNanoAudioEncoder(
         input_size=8,
         output_size=8,
@@ -34,23 +34,25 @@ def _tiny_model() -> SimpleNamespace:
     return SimpleNamespace(
         audio_tower=encoder,
         multi_modal_projector=projector,
-        config=SimpleNamespace(encoder_config=SimpleNamespace(input_size=8)),
+        config=SimpleNamespace(audio_config=SimpleNamespace(input_size=8)),
     )
 
 
-def _stub_torch_compile_config(monkeypatch) -> None:
+def stub_torch_compile_config(monkeypatch) -> None:
     # The helper calls sglang's set_torch_compile_config, which mutates global
     # dynamo/inductor config; keep unit tests side-effect free.
-    import sglang.srt.model_executor.cuda_graph_runner as cuda_graph_runner
+    import sglang.srt.compilation.torch_compile_decoration as torch_compile_decoration
 
-    monkeypatch.setattr(cuda_graph_runner, "set_torch_compile_config", lambda: None)
+    monkeypatch.setattr(
+        torch_compile_decoration, "set_torch_compile_config", lambda: None
+    )
 
 
 def test_compile_fun_asr_audio_encoder_compiles_forwards_with_dynamic_shapes(
     monkeypatch,
 ) -> None:
-    _stub_torch_compile_config(monkeypatch)
-    model = _tiny_model()
+    stub_torch_compile_config(monkeypatch)
+    model = tiny_model()
     original_tower_forward = model.audio_tower.forward
     original_projector_forward = model.multi_modal_projector.forward
     tower_param_names = set(dict(model.audio_tower.named_parameters()))
@@ -58,18 +60,18 @@ def test_compile_fun_asr_audio_encoder_compiles_forwards_with_dynamic_shapes(
     compile_calls = []
     forward_shapes = []
 
-    def _fake_compile(fn, dynamic=None):
+    def fake_compile(fn, dynamic=None):
         compile_calls.append({"fn": fn, "dynamic": dynamic})
 
-        def _wrapped(xs):
-            forward_shapes.append(tuple(xs.shape))
-            return fn(xs)
+        def wrapped(xs, mask=None):
+            forward_shapes.append((tuple(xs.shape), mask is None))
+            return fn(xs, mask)
 
-        return _wrapped
+        return wrapped
 
-    monkeypatch.setattr(torch, "compile", _fake_compile)
+    monkeypatch.setattr(torch, "compile", fake_compile)
 
-    fun_asr_stages._compile_fun_asr_audio_encoder(model, warmup_lfr_frames=16)
+    fun_asr_stages.compile_fun_asr_audio_encoder(model, warmup_lfr_frames=16)
 
     assert [call["dynamic"] for call in compile_calls] == [True, True]
     assert compile_calls[0]["fn"] == original_tower_forward
@@ -78,9 +80,16 @@ def test_compile_fun_asr_audio_encoder_compiles_forwards_with_dynamic_shapes(
     # intact — load_weights and weight updates match checkpoint names against
     # named_parameters, so no _orig_mod prefixes may appear.
     assert set(dict(model.audio_tower.named_parameters())) == tower_param_names
-    # Warmup ran through both compiled forwards: encoder input [1, T, 560-dim
-    # equivalent], then the encoder's output into the projector.
-    assert forward_shapes == [(1, 16, 8), (1, 16, 8)]
+    # Warmup covers serving signatures: B1/None, B1/mask, B2/mask
+    # (each through encoder then projector).
+    assert forward_shapes == [
+        ((1, 16, 8), True),
+        ((1, 16, 8), True),
+        ((1, 16, 8), False),
+        ((1, 16, 8), False),
+        ((2, 16, 8), False),
+        ((2, 16, 8), False),
+    ]
 
 
 def test_compile_fun_asr_audio_encoder_warmup_matches_service_grad_mode(
@@ -92,40 +101,41 @@ def test_compile_fun_asr_audio_encoder_warmup_matches_service_grad_mode(
     # the context — merely calling inside it leaves a normal tensor whose
     # graph the service's tensors fail, costing a ~20 s recompile on the
     # first real request.
-    _stub_torch_compile_config(monkeypatch)
-    model = _tiny_model()
+    stub_torch_compile_config(monkeypatch)
+    model = tiny_model()
     modes = []
 
-    def _fake_compile(fn, dynamic=None):
-        def _wrapped(xs):
+    def fake_compile(fn, dynamic=None):
+        def wrapped(xs, mask=None):
             modes.append((torch.is_inference_mode_enabled(), torch.is_inference(xs)))
-            return fn(xs)
+            return fn(xs, mask)
 
-        return _wrapped
+        return wrapped
 
-    monkeypatch.setattr(torch, "compile", _fake_compile)
+    monkeypatch.setattr(torch, "compile", fake_compile)
 
-    fun_asr_stages._compile_fun_asr_audio_encoder(model, warmup_lfr_frames=16)
-    assert modes == [(True, True), (True, True)]
+    fun_asr_stages.compile_fun_asr_audio_encoder(model, warmup_lfr_frames=16)
+    # Three signatures × (encoder + projector).
+    assert modes == [(True, True)] * 6
 
     modes.clear()
-    model = _tiny_model()
-    fun_asr_stages._compile_fun_asr_audio_encoder(
+    model = tiny_model()
+    fun_asr_stages.compile_fun_asr_audio_encoder(
         model, warmup_lfr_frames=16, warmup_inference_mode=False
     )
-    assert modes == [(False, False), (False, False)]
+    assert modes == [(False, False)] * 6
 
 
 def test_compile_fun_asr_audio_encoder_rejects_degenerate_warmup_length(
     monkeypatch,
 ) -> None:
-    _stub_torch_compile_config(monkeypatch)
-    model = _tiny_model()
+    stub_torch_compile_config(monkeypatch)
+    model = tiny_model()
 
-    def _fail_compile(fn, dynamic=None):
+    def fail_compile(fn, dynamic=None):
         raise AssertionError("torch.compile must not run for invalid warmup")
 
-    monkeypatch.setattr(torch, "compile", _fail_compile)
+    monkeypatch.setattr(torch, "compile", fail_compile)
 
     with pytest.raises(ValueError, match="warmup_lfr_frames"):
-        fun_asr_stages._compile_fun_asr_audio_encoder(model, warmup_lfr_frames=1)
+        fun_asr_stages.compile_fun_asr_audio_encoder(model, warmup_lfr_frames=1)

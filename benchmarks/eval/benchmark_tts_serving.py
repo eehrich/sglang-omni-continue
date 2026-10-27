@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import logging
 import os
 import random
 import time
 from collections.abc import Iterable
+from itertools import groupby
 from pathlib import Path
 
 import aiohttp
@@ -43,6 +46,7 @@ from benchmarks.tts_serving.scenarios import Scenario, build_scenarios
 from benchmarks.tts_serving.sdk_client import run_sdk_scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError, load_spec
 from benchmarks.tts_serving.ws_client import run_ws_scenario
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 LOAD_GENERATOR_LAGGED_THRESHOLD_S = 1.0
 DEFAULT_SPEC_PATH = "/etc/benchmark/spec.json"
@@ -55,6 +59,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TTS serving benchmark harness.")
     parser.add_argument("--spec", default=DEFAULT_SPEC_PATH)
     parser.add_argument("--out", default=DEFAULT_OUT_DIR)
+    parser.add_argument("--router-stage-snapshots")
     return parser
 
 
@@ -62,7 +67,10 @@ async def _run_benchmark(
     spec: BenchmarkSpec,
     scenarios: list[Scenario],
     harness_log: list[str],
-) -> list[ScenarioResult]:
+    results: list[ScenarioResult],
+    *,
+    router_stage_snapshots: Path | None = None,
+) -> None:
     timeout = aiohttp.ClientTimeout(total=spec.params.timeout_s)
     headers = _auth_headers(spec)
     connector = aiohttp.TCPConnector(limit=_connector_limit(spec))
@@ -71,11 +79,18 @@ async def _run_benchmark(
         headers=headers,
         connector=connector,
     ) as session:
-        results: list[ScenarioResult] = []
+        stage_snapshots: dict[str, dict] = {}
         for stage in spec.params.load_stages:
             stage_scenarios = [
                 scenario for scenario in scenarios if scenario.stage_id == stage.id
             ]
+            before = None
+            if router_stage_snapshots is not None:
+                before = await _wait_for_router_idle(
+                    session,
+                    spec.base_url,
+                    timeout_s=spec.params.timeout_s,
+                )
             results.extend(
                 await _run_stage(
                     session,
@@ -85,7 +100,102 @@ async def _run_benchmark(
                     harness_log,
                 )
             )
-        return results
+            if router_stage_snapshots is not None:
+                try:
+                    after = await _wait_for_router_idle(
+                        session,
+                        spec.base_url,
+                        timeout_s=spec.params.timeout_s,
+                        expected_worker_ids=tuple(
+                            worker["worker_id"] for worker in before["workers"]
+                        ),
+                    )
+                except Exception as exc:
+                    stage_snapshots[stage.id] = {
+                        "before": before,
+                        "after": None,
+                        "observation_error": {
+                            "type": exc.__class__.__name__,
+                            "message": str(exc),
+                        },
+                    }
+                    router_stage_snapshots.write_text(
+                        json.dumps(stage_snapshots, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    raise
+                stage_snapshots[stage.id] = {"before": before, "after": after}
+                router_stage_snapshots.write_text(
+                    json.dumps(stage_snapshots, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+
+async def _router_diagnostics(
+    session: aiohttp.ClientSession,
+    base_url: str,
+) -> dict:
+    async with session.get(f"{base_url.rstrip('/')}/diagnostics") as response:
+        response.raise_for_status()
+        payload = await response.json()
+    if not isinstance(payload, dict):
+        raise TypeError("router /diagnostics response must be a JSON object")
+    return payload
+
+
+async def _wait_for_router_idle(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    *,
+    timeout_s: int,
+    expected_worker_ids: tuple[str, ...] | None = None,
+) -> dict:
+    deadline = time.monotonic() + timeout_s
+    snapshot: dict = {}
+    while time.monotonic() < deadline:
+        snapshot = await _router_diagnostics(session, base_url)
+        if _router_is_quiescent(
+            snapshot,
+            expected_worker_ids=expected_worker_ids,
+        ):
+            return snapshot
+        await asyncio.sleep(0.1)
+    raise TimeoutError(f"router did not become quiescent: {snapshot}")
+
+
+def _router_is_quiescent(
+    snapshot: dict,
+    *,
+    expected_worker_ids: tuple[str, ...] | None,
+) -> bool:
+    workers = snapshot.get("workers")
+    admission = snapshot.get("admission")
+    resources = snapshot.get("resources", {})
+    if not isinstance(workers, list) or not workers:
+        return False
+    worker_ids = tuple(worker.get("worker_id") for worker in workers)
+    if not all(isinstance(worker_id, str) for worker_id in worker_ids):
+        return False
+    if expected_worker_ids is not None and worker_ids != expected_worker_ids:
+        return False
+    if not isinstance(admission, list) or not admission:
+        return False
+    return (
+        snapshot.get("lifecycle") == "serving"
+        and snapshot.get("ready") is True
+        and all(worker.get("health") == "healthy" for worker in workers)
+        and all(worker.get("routable") is True for worker in workers)
+        and all(worker.get("active_requests") == 0 for worker in workers)
+        and all(
+            capacity.get("in_flight") == 0
+            for worker in workers
+            for capacity in worker.get("capacity", [])
+        )
+        and all(entry.get("in_flight") == 0 for entry in admission)
+        and resources.get("buffered_request_bytes", {}).get("in_use") == 0
+        and resources.get("classification_slots", {}).get("in_use") == 0
+        and resources.get("websocket_sessions_registered") == 0
+    )
 
 
 async def _run_stage(
@@ -95,7 +205,7 @@ async def _run_stage(
     scenarios: list[Scenario],
     harness_log: list[str],
 ) -> list[ScenarioResult]:
-    if len(scenarios) > stage.request_count:
+    if stage.mode != "scheduled" and len(scenarios) > stage.request_count:
         harness_log.append(
             f"stage={stage.id} scheduled {len(scenarios)} scenarios although "
             f"request_count={stage.request_count}; required benchmark contracts "
@@ -160,7 +270,11 @@ async def _run_scheduled_stage(
     harness_log: list[str],
 ) -> list[ScenarioResult]:
     stage_start = time.perf_counter()
-    offsets = _planned_offsets(stage, len(scenarios), seed=spec.seed)
+    offsets = (
+        [_scheduled_offset(scenario) for scenario in scenarios]
+        if stage.mode == "scheduled"
+        else _planned_offsets(stage, len(scenarios), seed=spec.seed)
+    )
     active_requests = 0
     peak_inflight = 0
 
@@ -178,6 +292,8 @@ async def _run_scheduled_stage(
             planned_start=planned_start,
             actual_start=actual_start,
             generator_lag=max(0.0, actual_start - planned_start),
+            configured_offset=offset,
+            collision_epoch=scenario.collision_epoch_s,
         )
         return result
 
@@ -186,7 +302,18 @@ async def _run_scheduled_stage(
     results: list[ScenarioResult] = []
     peak_pending_tasks = 0
     scheduled_task_count = 0
-    for scenario, offset in zip(scenarios, offsets, strict=True):
+    arrivals = list(zip(scenarios, offsets, strict=True))
+    if stage.mode == "scheduled":
+        arrival_groups: Iterable[tuple[float, list[Scenario]]] = (
+            (offset, [scenario for scenario, _ in grouped_arrivals])
+            for offset, grouped_arrivals in groupby(
+                arrivals,
+                key=lambda item: item[1],
+            )
+        )
+    else:
+        arrival_groups = ((offset, [scenario]) for scenario, offset in arrivals)
+    for offset, group in arrival_groups:
         planned_start = stage_start + offset
         delay_s = planned_start - time.perf_counter()
         if delay_s > 0:
@@ -195,10 +322,10 @@ async def _run_scheduled_stage(
         if done:
             pending.difference_update(done)
             results.extend(_harvest_completed_tasks(done))
-        scheduled_task_count += 1
-        if active_requests >= stage.max_concurrency:
+        scheduled_task_count += len(group)
+        if active_requests + len(group) > stage.max_concurrency:
             actual_start = time.perf_counter()
-            results.append(
+            results.extend(
                 _load_generator_saturated_result(
                     scenario,
                     stage=stage,
@@ -206,12 +333,16 @@ async def _run_scheduled_stage(
                     actual_start=actual_start,
                     active_requests=active_requests,
                     generator_lag=max(0.0, actual_start - planned_start),
+                    configured_offset=offset,
                 )
+                for scenario in group
             )
             continue
-        active_requests += 1
+        active_requests += len(group)
         peak_inflight = max(peak_inflight, active_requests)
-        pending.add(asyncio.create_task(run_planned(scenario, offset)))
+        pending.update(
+            asyncio.create_task(run_planned(scenario, offset)) for scenario in group
+        )
         peak_pending_tasks = max(peak_pending_tasks, len(pending))
     if pending:
         results.extend(await _gather_pending_tasks(pending))
@@ -248,6 +379,7 @@ def _load_generator_saturated_result(
     actual_start: float,
     active_requests: int,
     generator_lag: float,
+    configured_offset: float,
 ) -> ScenarioResult:
     result = ScenarioResult(
         scenario_id=scenario.id,
@@ -276,6 +408,8 @@ def _load_generator_saturated_result(
         actual_start=actual_start,
         peak_inflight=active_requests,
         generator_lag=generator_lag,
+        configured_offset=configured_offset,
+        collision_epoch=scenario.collision_epoch_s,
     )
     return result
 
@@ -362,16 +496,26 @@ def _attach_schedule_metadata(
     actual_start: float,
     peak_inflight: int | None = None,
     generator_lag: float | None = None,
+    configured_offset: float | None = None,
+    collision_epoch: float | None = None,
 ) -> None:
     result.stage_id = stage.id
     result.load_mode = stage.mode
     result.load_concurrency = stage.max_concurrency
     result.configured_max_concurrency = stage.max_concurrency
     result.peak_inflight = peak_inflight
+    result.configured_offset_s = configured_offset
+    result.collision_epoch_s = collision_epoch
     result.planned_start_s = planned_start
     result.actual_start_s = actual_start
     result.queue_wait_s = max(0.0, actual_start - planned_start)
     result.generator_lag_s = generator_lag
+
+
+def _scheduled_offset(scenario: Scenario) -> float:
+    if scenario.t_offset_s is None:
+        raise ValueError(f"scheduled scenario {scenario.id!r} is missing t_offset_s")
+    return scenario.t_offset_s
 
 
 def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[float]:
@@ -714,6 +858,11 @@ def _print_failure_summary(report: dict) -> None:
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    configure_dependency_loggers()
     args = _build_arg_parser().parse_args()
     harness_log: list[str] = []
     try:
@@ -723,15 +872,32 @@ def main() -> int:
         print(f"benchmark harness failed: {exc}")
         return 2
 
-    scenarios = build_scenarios(spec)
-    stage_request_total = sum(stage.request_count for stage in spec.params.load_stages)
-    harness_log.append(
-        f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
-        f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
-        f"load_stages={[stage.id for stage in spec.params.load_stages]}"
-    )
+    scenarios: list[Scenario] = []
+    results: list[ScenarioResult] = []
     try:
-        results = asyncio.run(_run_benchmark(spec, scenarios, harness_log))
+        scenarios = build_scenarios(spec)
+        stage_request_total = sum(
+            stage.request_count for stage in spec.params.load_stages
+        )
+        harness_log.append(
+            f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
+            f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
+            f"load_stages={[stage.id for stage in spec.params.load_stages]}"
+        )
+        router_stage_snapshots = (
+            Path(args.router_stage_snapshots)
+            if args.router_stage_snapshots is not None
+            else None
+        )
+        asyncio.run(
+            _run_benchmark(
+                spec,
+                scenarios,
+                harness_log,
+                results,
+                router_stage_snapshots=router_stage_snapshots,
+            )
+        )
         report = build_results_report(spec, results, scenarios=scenarios)
         write_artifacts(out_dir, spec, scenarios, results, report)
         write_harness_log(out_dir, harness_log)
@@ -743,13 +909,13 @@ def main() -> int:
         harness_log.append(f"unhandled harness error: {exc.__class__.__name__}: {exc}")
         report = build_results_report(
             spec,
-            [],
+            results,
             scenarios=scenarios,
             harness_status="error",
             harness_error=f"{exc.__class__.__name__}: {exc}",
         )
         try:
-            write_artifacts(out_dir, spec, scenarios, [], report)
+            write_artifacts(out_dir, spec, scenarios, results, report)
             write_harness_log(out_dir, harness_log)
         except ArtifactError:
             pass

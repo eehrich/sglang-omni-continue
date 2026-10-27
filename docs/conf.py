@@ -1,15 +1,12 @@
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, os.path.abspath("../.."))
-
 DOCS_PATH = Path(__file__).parent
 ROOT_PATH = DOCS_PATH.parent
+sys.path.insert(0, str(ROOT_PATH))
 
-
-__version__ = "0.1.0"
+from sglang_omni import __version__  # noqa: E402
 
 project = "SGLang"
 copyright = f"2025-{datetime.now().year}, SGLang-Omni"
@@ -89,7 +86,14 @@ master_doc = "index"
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["build", "Thumbs.db", ".DS_Store", "developer_reference/mlx.md"]
+
+html_additional_pages = {
+    "developer_reference/mlx": "mlx_redirect.html",
+    "developer_reference/full_duplex_bench": "full_duplex_bench_redirect.html",
+    "developer_reference/full_duplex_metrics": "full_duplex_metrics_redirect.html",
+    "developer_reference/full_duplex_interactive_model": "full_duplex_interactive_model_redirect.html",
+}
 
 pygments_style = "sphinx"
 

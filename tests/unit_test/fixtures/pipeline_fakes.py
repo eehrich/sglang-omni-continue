@@ -8,7 +8,10 @@ and Relay. They intentionally avoid real ZMQ, CUDA, SGLang, and relay backends.
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+import os
 import queue
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -16,7 +19,7 @@ import torch
 
 from sglang_omni.config.schema import PipelineConfig
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 
 
 @dataclass
@@ -29,24 +32,24 @@ class EventLog:
 
 class FakeOp:
     def __init__(self, metadata: dict[str, Any], log: EventLog | None = None):
-        self._metadata = metadata
+        self.metadata_value = metadata
         self.log = log or EventLog()
         self.waited = False
         self.failed: BaseException | None = None
 
     @property
     def metadata(self) -> dict[str, Any]:
-        return self._metadata
+        return self.metadata_value
 
     async def wait_for_completion(self, timeout: float = 30.0) -> None:
         del timeout
         self.waited = True
-        self.log.append("op_wait", self._metadata.get("key"))
+        self.log.append("op_wait", self.metadata_value.get("key"))
         if self.failed is not None:
             raise self.failed
 
     def mark_receiver_done(self) -> None:
-        self.log.append("op_ack", self._metadata.get("key"))
+        self.log.append("op_ack", self.metadata_value.get("key"))
 
     def mark_receiver_failed(self, exc: BaseException) -> None:
         self.failed = exc
@@ -130,6 +133,9 @@ class FakeScheduler:
         self.started = False
         self.stopped = False
         self.aborted: list[str] = []
+
+    def warm_up_serving_thread(self) -> None:
+        pass
 
     def start(self) -> None:
         self.started = True
@@ -259,6 +265,16 @@ def runtime_factory_without_total_budget(
     }
 
 
+def runtime_factory_without_gpu_id(*, model_path: str) -> dict[str, Any]:
+    return {"model_path": model_path}
+
+
+def runtime_factory_with_device(
+    *, model_path: str, device: Any = "cuda:0"
+) -> dict[str, Any]:
+    return {"model_path": model_path, "device": device}
+
+
 def make_scheduler_accepting_model_path(
     model_path: str, **kwargs: Any
 ) -> FakeScheduler:
@@ -273,6 +289,103 @@ def make_scheduler_accepting_gpu_id(gpu_id: int = -1, **kwargs: Any) -> FakeSche
     scheduler.gpu_id = gpu_id
     scheduler.factory_kwargs = kwargs
     return scheduler
+
+
+class ReplicaProcessProbeScheduler:
+    """Exercise payload and stream routing inside a replicated OS process."""
+
+    def __init__(self, marker: str, *, emit_stream: bool = False) -> None:
+        self.inbox: queue.Queue[IncomingMessage] = queue.Queue()
+        self.outbox: queue.Queue[OutgoingMessage] = queue.Queue()
+        self.requires_tp_work_fanout = True
+        self.marker = marker
+        self.emit_stream = emit_stream
+        self.running = False
+        self.stream_chunks: dict[str, list[Any]] = {}
+        self.stream_done: set[str] = set()
+
+    def warm_up_serving_thread(self) -> None:
+        pass
+
+    def start(self) -> None:
+        self.running = True
+        while self.running:
+            try:
+                msg = self.inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if msg.type == "stream_chunk":
+                self.stream_chunks.setdefault(msg.request_id, []).append(msg.data.data)
+                continue
+            if msg.type == "stream_done":
+                self.stream_done.add(msg.request_id)
+                continue
+            if msg.type != "new_request":
+                continue
+            try:
+                self.handle_request(msg)
+            except Exception as exc:
+                self.outbox.put(
+                    OutgoingMessage(
+                        request_id=msg.request_id,
+                        type="error",
+                        data=exc,
+                    )
+                )
+
+    def handle_request(self, msg: IncomingMessage) -> None:
+        payload = msg.data
+        process_name = multiprocessing.current_process().name
+        process_id = os.getpid()
+        if self.emit_stream:
+            payload.data[f"{self.marker}_process"] = process_name
+            payload.data[f"{self.marker}_pid"] = process_id
+            payload.data["producer_payload_id"] = id(payload)
+            payload.data["_local_marker"] = threading.Lock()
+            self.outbox.put(
+                OutgoingMessage(
+                    request_id=msg.request_id,
+                    type="stream",
+                    data={"process": process_name, "pid": process_id},
+                )
+            )
+        else:
+            chunks = self.stream_chunks.pop(msg.request_id, [])
+            if len(chunks) != 1 or msg.request_id not in self.stream_done:
+                raise AssertionError(
+                    f"request {msg.request_id} did not receive one completed stream"
+                )
+            self.stream_done.discard(msg.request_id)
+            local_marker = payload.data.pop("_local_marker", None)
+            if local_marker is None:
+                raise AssertionError("same-process payload lost its local marker")
+            payload.data[f"{self.marker}_process"] = process_name
+            payload.data[f"{self.marker}_pid"] = process_id
+            payload.data["same_payload_object"] = payload.data[
+                "producer_payload_id"
+            ] == id(payload)
+            payload.data["stream_process"] = chunks[0]["process"]
+            payload.data["stream_pid"] = chunks[0]["pid"]
+        self.outbox.put(
+            OutgoingMessage(
+                request_id=msg.request_id,
+                type="result",
+                data=payload,
+            )
+        )
+
+    def stop(self) -> None:
+        self.running = False
+
+    def abort(self, request_id: str) -> None:
+        self.stream_chunks.pop(request_id, None)
+        self.stream_done.discard(request_id)
+
+
+def make_replica_process_probe_scheduler(
+    *, marker: str, emit_stream: bool = False
+) -> ReplicaProcessProbeScheduler:
+    return ReplicaProcessProbeScheduler(marker, emit_stream=emit_stream)
 
 
 def identity_route(request_id: str, output: Any) -> str:
@@ -456,7 +569,7 @@ def collect_event_names(log: EventLog) -> list[Any]:
 
 
 def make_noop_projector(marker: str) -> Callable[[StagePayload], StagePayload]:
-    def _project(payload: StagePayload) -> StagePayload:
+    def project(payload: StagePayload) -> StagePayload:
         return make_stage_payload(
             request_id=payload.request_id,
             inputs=payload.request.inputs,
@@ -464,4 +577,37 @@ def make_noop_projector(marker: str) -> Callable[[StagePayload], StagePayload]:
             data={"marker": marker, "data": payload.data},
         )
 
-    return _project
+    return project
+
+
+def make_scheduler_consuming_kv_budget(**kwargs: Any) -> FakeScheduler:
+    from sglang_omni.scheduling.stage_kv_budget import consume_stage_kv_cache_bytes
+
+    scheduler = FakeScheduler()
+    scheduler.consumed_kv_cache_bytes = consume_stage_kv_cache_bytes()
+    scheduler.factory_kwargs = kwargs
+    return scheduler
+
+
+def block_on_inbox(monkeypatch: Any) -> None:
+    """Make the SimpleScheduler loop wait for a message instead of polling.
+
+    Only a message then wakes the loop, and stop puts a wakeup to end it, so a
+    scheduler check that runs only when the loop polls never runs.
+    """
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    stop = SimpleScheduler.stop
+
+    def next_message(self: SimpleScheduler) -> IncomingMessage:
+        if self.pending_messages:
+            return self.pending_messages.popleft()
+        else:
+            return self.inbox.get()
+
+    def stop_and_wake(self: SimpleScheduler) -> None:
+        stop(self)
+        self.inbox.put(IncomingMessage("", "wakeup"))
+
+    monkeypatch.setattr(SimpleScheduler, "next_message", next_message)
+    monkeypatch.setattr(SimpleScheduler, "stop", stop_and_wake)

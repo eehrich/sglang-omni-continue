@@ -4,24 +4,26 @@ from __future__ import annotations
 import asyncio
 import queue
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
-from pydantic import ValidationError
 
+import sglang_omni.platforms as platforms
 from sglang_omni.comm import stage_io
 from sglang_omni.comm.data_ref import DataKind, DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine
-from sglang_omni.config.schema import StageConfig
-from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
+from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher, LocalStreamChunk
 from sglang_omni.pipeline.stage.runtime import Stage
-from sglang_omni.pipeline.stage.stream_queue import StreamQueue
+from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
 from sglang_omni.relay.shm import ShmRelay
-from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.message import OutgoingMessage, put_messages
+from tests.unit_test.fixtures.trace_capture import capture_comm_trace, events_named
+from tests.unit_test.pipeline.helpers import make_stage
 
 
-class _FakeControlPlane:
+class FakeControlPlane:
     recv_endpoint = "inproc://stage"
 
     def __init__(self) -> None:
@@ -45,7 +47,7 @@ class _FakeControlPlane:
         self.completions.append(msg)
 
 
-class _FakeRelay:
+class FakeRelay:
     def __init__(self) -> None:
         self.device = "cpu"
         self.puts = []
@@ -59,7 +61,7 @@ class _FakeRelay:
     ):
         del dst_rank, receiver_id
         self.puts.append((request_id, tensor))
-        return _DoneOp(tensor.numel())
+        return DoneOp(tensor.numel())
 
     def close(self) -> None:
         pass
@@ -68,7 +70,7 @@ class _FakeRelay:
         pass
 
 
-class _DoneOp:
+class DoneOp:
     def __init__(self, size: int = 1) -> None:
         self.metadata = {"transfer_info": {"size": size}}
 
@@ -82,24 +84,24 @@ class _DoneOp:
         raise exc
 
 
-class _AbortOnReadRelay(_FakeRelay):
+class AbortOnReadRelay(FakeRelay):
     def __init__(self, on_wait) -> None:
         super().__init__()
-        self._on_wait = on_wait
+        self.on_wait = on_wait
         self.gets = 0
 
     async def get_async(self, metadata, dest_tensor, request_id):
         del metadata, dest_tensor, request_id
         self.gets += 1
-        return _CallbackOp(self._on_wait)
+        return CallbackOp(self.on_wait)
 
 
-class _CallbackOp:
+class CallbackOp:
     def __init__(self, on_wait) -> None:
-        self._on_wait = on_wait
+        self.on_wait = on_wait
 
     async def wait_for_completion(self) -> None:
-        self._on_wait()
+        self.on_wait()
 
     def mark_receiver_done(self) -> None:
         pass
@@ -114,7 +116,7 @@ class _CallbackOp:
 # ``write_stream_chunk`` / ``write_payload`` produce on the wire.
 
 
-async def _make_relay_chunk(
+async def make_relay_chunk(
     relay,
     *,
     request_id: str,
@@ -136,7 +138,7 @@ async def _make_relay_chunk(
         to_stage=to_stage,
     )
     pending_ops = [op]
-    data_ref = await stage_io._with_stream_metadata(
+    data_ref = await stage_io.with_stream_metadata(
         relay,
         data_ref,
         metadata,
@@ -152,7 +154,7 @@ async def _make_relay_chunk(
     )
 
 
-async def _make_relay_payload(
+async def make_relay_payload(
     relay,
     payload: StagePayload,
     *,
@@ -174,8 +176,8 @@ async def _make_relay_payload(
 
 
 def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(outbox=queue.Queue())
         stage = Stage(
             name="vocoder",
@@ -184,11 +186,11 @@ def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
             gpu_id=None,
             endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
-            relay=_FakeRelay(),
+            relay=FakeRelay(),
             scheduler=scheduler,
             is_terminal=True,
         )
-        stage._active_requests.add("req")
+        stage.active_requests.add("req")
         scheduler.outbox.put(
             OutgoingMessage(
                 request_id="req",
@@ -204,7 +206,8 @@ def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
             )
         )
 
-        await stage._drain_outbox_external()
+        stage.end_outbox_drain()
+        await stage.drain_outbox_external()
 
         assert len(control_plane.streams) == 2
         msg = control_plane.streams[0]
@@ -214,15 +217,126 @@ def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
         assert msg.modality == "audio"
         assert [msg.chunk_id for msg in control_plane.streams] == [0, 1]
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
-def test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
+def test_outbox_drain_reuses_one_executor_wakeup_for_ready_messages(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        run_in_executor = AsyncMock(side_effect=lambda _, get: get())
+        monkeypatch.setattr(loop, "run_in_executor", run_in_executor)
+
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(outbox=queue.Queue())
-        codes = torch.empty(11, 1, dtype=torch.long)
+        stage = Stage(
+            name="vocoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"tts_engine": "inproc://tts_engine"},
+            control_plane=control_plane,
+            relay=FakeRelay(),
+            scheduler=scheduler,
+            is_terminal=True,
+        )
+        stage.active_requests.add("req-live")
+
+        messages = [
+            OutgoingMessage("req-live", "stream", {"sequence": 0}),
+            OutgoingMessage("req-stale", "stream", {"sequence": 999}),
+            OutgoingMessage("req-live", "stream", {"sequence": 1}),
+            OutgoingMessage("req-live", "result", {"answer": "done"}),
+        ]
+        for message in messages:
+            scheduler.outbox.put(message)
+
+        stage.end_outbox_drain()
+        await stage.drain_outbox_external()
+
+        assert [
+            (msg.chunk_id, msg.chunk["sequence"]) for msg in control_plane.streams
+        ] == [(0, 0), (1, 1)]
+        assert len(control_plane.completions) == 1
+        completion = control_plane.completions[0]
+        assert (completion.success, completion.result) == (True, {"answer": "done"})
+        assert scheduler.outbox.empty()
+        assert not stage.active_requests
+
+        # Before this optimization each message required an executor round trip.
+        run_in_executor.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_outbox_drain_yields_after_ready_message_batch(monkeypatch) -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        run_in_executor = AsyncMock(side_effect=lambda _, get: get())
+        monkeypatch.setattr(loop, "run_in_executor", run_in_executor)
+
+        execution_order: list[int | str] = []
+
+        class RecordingControlPlane(FakeControlPlane):
+            async def send_stream(self, msg) -> None:
+                execution_order.append(msg.chunk["sequence"])
+                await super().send_stream(msg)
+
+        control_plane = RecordingControlPlane()
+        scheduler = SimpleNamespace(outbox=queue.Queue())
+        stage = Stage(
+            name="vocoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"tts_engine": "inproc://tts_engine"},
+            control_plane=control_plane,
+            relay=FakeRelay(),
+            scheduler=scheduler,
+            is_terminal=True,
+        )
+        stage.active_requests.add("req-live")
+
+        for sequence in range(1, 66):
+            scheduler.outbox.put(
+                OutgoingMessage("req-live", "stream", {"sequence": sequence})
+            )
+
+        async def competing_ready_coroutine() -> None:
+            execution_order.append("competing-coroutine")
+
+        competing_task = asyncio.create_task(competing_ready_coroutine())
+        stage.end_outbox_drain()
+        await stage.drain_outbox_external()
+        await competing_task
+
+        assert execution_order == [
+            *range(1, 65),
+            "competing-coroutine",
+            65,
+        ]
+        assert [msg.chunk["sequence"] for msg in control_plane.streams] == list(
+            range(1, 66)
+        )
+        assert scheduler.outbox.empty()
+        assert run_in_executor.await_count == 2
+
+    asyncio.run(run())
+
+
+def test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        platforms.current_platform, "device_type", "cuda", raising=False
+    )
+
+    async def run() -> None:
+        control_plane = FakeControlPlane()
+        relay = FakeRelay()
+        scheduler = SimpleNamespace(outbox=queue.Queue())
+        codes = torch.empty(4096, 1, dtype=torch.long)
         stage = Stage(
             name="tts_engine",
             role="single",
@@ -233,7 +347,7 @@ def test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing() -> None
             relay=relay,
             scheduler=scheduler,
         )
-        stage._active_requests.add("req")
+        stage.active_requests.add("req")
         scheduler.outbox.put(
             OutgoingMessage(
                 request_id="req",
@@ -244,7 +358,8 @@ def test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing() -> None
             )
         )
 
-        await stage._drain_outbox_external()
+        stage.end_outbox_drain()
+        await stage.drain_outbox_external()
 
         assert control_plane.streams == []
         assert len(relay.puts) == 1
@@ -258,33 +373,250 @@ def test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing() -> None
         assert msg.chunk_id == 0
         assert DataRef.from_dict(msg.data_ref).metadata == {"modality": "audio_codes"}
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
-def test_stage_config_rejects_unknown_model_transport_field() -> None:
-    field_name = "stream_" + "transport"
-    with pytest.raises(ValidationError):
-        StageConfig(
-            name="tts_engine",
-            factory="pkg.create",
-            next="vocoder",
-            stream_to=["vocoder"],
-            **{field_name: {"vocoder": "relay"}},
+def test_small_cpu_scheduler_stream_chunk_rides_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        control_plane = FakeControlPlane()
+        relay = FakeRelay()
+        scheduler = SimpleNamespace(outbox=queue.Queue())
+        token = torch.tensor([42], dtype=torch.long)
+        stage = Stage(
+            name="thinker",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"decode": "inproc://decode"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=scheduler,
+        )
+        stage.active_requests.add("req")
+        stage.replica_bindings["req"] = {"decode": 1}
+        scheduler.outbox.put(
+            OutgoingMessage(
+                request_id="req",
+                type="stream",
+                data=token,
+                target="decode",
+                metadata={"token_id": 42},
+            )
         )
 
+        stage.end_outbox_drain()
+        await stage.drain_outbox_external()
 
-def test_s2pro_config_declares_topology_without_transport_policy() -> None:
-    config = S2ProPipelineConfig(model_path="dummy")
-    tts_stage = next(stage for stage in config.stages if stage.name == "tts_engine")
-    vocoder_stage = next(stage for stage in config.stages if stage.name == "vocoder")
-    assert tts_stage.stream_to == ["vocoder"]
-    assert vocoder_stage.can_accept_stream_before_payload
-    assert "stream_transport" not in StageConfig.model_fields
+        assert relay.puts == []
+        assert len(control_plane.stage_messages) == 1
+        target, endpoint, msg = control_plane.stage_messages[0]
+        assert target == "decode"
+        assert endpoint == "inproc://decode"
+        assert msg.chunk_id == 0
+        assert msg.replica_bindings == {"decode": 1}
+        assert stage_io.is_inline_stream_chunk_ref(msg.data_ref)
+        data, metadata = stage_io.deserialize_inline_stream_chunk(msg.data_ref)
+        assert torch.equal(data, token)
+        assert metadata == {"token_id": 42}
+
+    with capture_comm_trace(monkeypatch) as events:
+        asyncio.run(run())
+
+    selected = events_named(events, "comm_transport_selected")
+    assert len(selected) == 1
+    assert selected[0]["direction"] == "stream"
+    assert selected[0]["peer_stage"] == "decode"
+    assert selected[0]["transport"] == "inline"
+
+    sent = events_named(events, "comm_stream_send")
+    assert len(sent) == 1
+    assert sent[0]["request_id"] == "req"
+    assert sent[0]["from_stage"] == "thinker"
+    assert sent[0]["to_stage"] == "decode"
+    assert sent[0]["transport"] == "inline"
+    assert sent[0]["bytes"] == 8
+
+
+def test_inline_stream_chunk_gate() -> None:
+    small = torch.zeros(8, dtype=torch.long)
+    assert stage_io.serialize_inline_stream_chunk(small, {"token_id": 1}) is not None
+    assert stage_io.serialize_inline_stream_chunk(small, None) is not None
+    big = torch.zeros(
+        stage_io._INLINE_STREAM_CHUNK_BYTES_LIMIT + 1, dtype=torch.uint8
+    )  # noqa: leading-underscore  # production name
+    assert stage_io.serialize_inline_stream_chunk(big, None) is None
+    assert (
+        stage_io.serialize_inline_stream_chunk(small, {"extra": torch.zeros(2)}) is None
+    )
+    assert stage_io.serialize_inline_stream_chunk("not-a-tensor", None) is None
+
+
+def test_inline_stream_chunk_rejects_oversized_serialized_payload() -> None:
+    token = torch.tensor([7], dtype=torch.long)
+    metadata = {
+        "text": "x" * stage_io._INLINE_STREAM_CHUNK_BYTES_LIMIT
+    }  # noqa: leading-underscore  # production name
+
+    data_ref = stage_io.serialize_inline_stream_chunk(token, metadata)
+
+    assert data_ref is None
+
+
+def test_inline_stream_chunk_rejects_non_cpu_tensor() -> None:
+    tensor = torch.empty(1, device="meta")
+
+    data_ref = stage_io.serialize_inline_stream_chunk(tensor, None)
+
+    assert data_ref is None
+
+
+def test_inline_stream_chunk_rejects_invalid_metadata_type() -> None:
+    data_ref = {
+        "_type": stage_io._INLINE_STREAM_CHUNK_TYPE,  # noqa: leading-underscore  # production name
+        "version": 1,
+        "payload": stage_io.pickle.dumps((torch.tensor([7]), ["invalid"])),
+    }
+
+    with pytest.raises(TypeError, match="metadata must be dict or None"):
+        stage_io.deserialize_inline_stream_chunk(data_ref)
+
+
+def test_inline_stream_chunk_rejects_oversized_received_payload() -> None:
+    data_ref = {
+        "_type": stage_io._INLINE_STREAM_CHUNK_TYPE,  # noqa: leading-underscore  # production name
+        "version": 1,
+        "payload": b"x"
+        * (
+            stage_io._INLINE_STREAM_CHUNK_BYTES_LIMIT + 1
+        ),  # noqa: leading-underscore  # production name
+    }
+
+    with pytest.raises(ValueError, match="payload exceeds"):
+        stage_io.deserialize_inline_stream_chunk(data_ref)
+
+
+def test_inline_stream_chunk_rejects_non_cpu_received_tensor() -> None:
+    data_ref = {
+        "_type": stage_io._INLINE_STREAM_CHUNK_TYPE,  # noqa: leading-underscore  # production name
+        "version": 1,
+        "payload": stage_io.pickle.dumps((torch.empty(1, device="meta"), None)),
+    }
+
+    with pytest.raises(ValueError, match="data must be a CPU tensor"):
+        stage_io.deserialize_inline_stream_chunk(data_ref)
+
+
+def test_inline_stream_chunk_materializes_small_view_storage() -> None:
+    view = torch.zeros(1024 * 1024, dtype=torch.uint8)[:8]
+
+    data_ref = stage_io.serialize_inline_stream_chunk(view, None)
+    restored, _ = stage_io.deserialize_inline_stream_chunk(data_ref)
+
+    assert restored.untyped_storage().nbytes() == restored.numel()
+
+
+def test_inline_stream_chunk_does_not_clone_small_owning_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tensor = torch.tensor([7], dtype=torch.long)
+    serialized_tensor: torch.Tensor | None = None
+
+    def capture_payload(payload) -> bytes:
+        nonlocal serialized_tensor
+        serialized_tensor = payload[0]
+        return b"payload"
+
+    monkeypatch.setattr(stage_io.pickle, "dumps", capture_payload)
+
+    stage_io.serialize_inline_stream_chunk(tensor, None)
+
+    assert serialized_tensor is not None
+    assert serialized_tensor.data_ptr() == tensor.data_ptr()
+
+
+def test_stage_routes_inline_stream_chunk_to_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        control_plane = FakeControlPlane()
+        relay = ShmRelay(engine_id="t-inline", device="cpu")
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="decode",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={
+                "thinker": "inproc://thinker",
+                "tts_engine": "inproc://tts_engine",
+            },
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=scheduler,
+        )
+        stage.stream_queue = StreamQueue()
+        payload = StagePayload(
+            request_id="req",
+            request=OmniRequest(inputs="hello"),
+            data={"ready": True},
+        )
+        await stage.on_data_ready(await make_relay_payload(relay, payload))
+        token = torch.tensor([7], dtype=torch.long)
+        msg = DataReadyMessage(
+            request_id="req",
+            from_stage="thinker",
+            to_stage="decode",
+            data_ref=stage_io.serialize_inline_stream_chunk(token, {"token_id": 7}),
+            chunk_id=0,
+        )
+
+        await stage.on_stream_chunk(msg)
+
+        payload_msg = scheduler.inbox.get_nowait()
+        chunk_msg = scheduler.inbox.get_nowait()
+        assert payload_msg.type == "new_request"
+        assert chunk_msg.type == "stream_chunk"
+        assert torch.equal(chunk_msg.data.data, token)
+        assert chunk_msg.data.metadata == {"token_id": 7}
+
+    with capture_comm_trace(monkeypatch) as events:
+        asyncio.run(run())
+
+    received = events_named(events, "comm_stream_read")
+    assert len(received) == 1
+    assert received[0]["request_id"] == "req"
+    assert received[0]["from_stage"] == "thinker"
+    assert received[0]["to_stage"] == "decode"
+    assert received[0]["transport"] == "inline"
+    assert received[0]["bytes"] == 8
+
+
+def test_stream_queue_drops_chunk_after_request_cleanup() -> None:
+    stream_queue = StreamQueue()
+    stream_queue.open("req")
+    stream_queue.close("req")
+
+    stream_queue.put(
+        "req",
+        StreamItem(
+            chunk_id=0,
+            data=torch.tensor([1]),
+            from_stage="thinker",
+        ),
+    )
+
+    assert not stream_queue.has("req")
 
 
 def test_stage_fails_pre_payload_stream_chunk_by_default() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
@@ -301,11 +633,11 @@ def test_stage_fails_pre_payload_stream_chunk_by_default() -> None:
             relay=relay,
             scheduler=scheduler,
         )
-        stage._stream_queue = StreamQueue(max_pending=4096)
+        stage.stream_queue = StreamQueue()
         codes = torch.arange(11, dtype=torch.float32)
 
-        await stage._on_stream_chunk(
-            await _make_relay_chunk(
+        await stage.on_stream_chunk(
+            await make_relay_chunk(
                 relay,
                 request_id="req",
                 from_stage="tts_engine",
@@ -320,12 +652,12 @@ def test_stage_fails_pre_payload_stream_chunk_by_default() -> None:
         assert control_plane.completions[0].success is False
         assert "pre-payload stream data" in control_plane.completions[0].error
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
@@ -342,16 +674,16 @@ def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
             relay=relay,
             scheduler=scheduler,
         )
-        stage._stream_queue = StreamQueue(max_pending=4096)
+        stage.stream_queue = StreamQueue()
         payload = StagePayload(
             request_id="req",
             request=OmniRequest(inputs="hello"),
             data={"ready": True},
         )
-        await stage._on_data_ready(await _make_relay_payload(relay, payload))
+        await stage.on_data_ready(await make_relay_payload(relay, payload))
         codes = torch.arange(11, dtype=torch.float32)
-        await stage._on_stream_chunk(
-            await _make_relay_chunk(
+        await stage.on_stream_chunk(
+            await make_relay_chunk(
                 relay,
                 request_id="req",
                 from_stage="tts_engine",
@@ -366,12 +698,12 @@ def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
         assert chunk_msg.type == "stream_chunk"
         assert torch.equal(chunk_msg.data.data, codes)
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
@@ -389,11 +721,11 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
             scheduler=scheduler,
             can_accept_stream_before_payload=True,
         )
-        stage._stream_queue = StreamQueue(max_pending=4096)
+        stage.stream_queue = StreamQueue()
         codes = torch.arange(11, dtype=torch.float32)
 
-        await stage._on_stream_chunk(
-            await _make_relay_chunk(
+        await stage.on_stream_chunk(
+            await make_relay_chunk(
                 relay,
                 request_id="req",
                 from_stage="tts_engine",
@@ -410,7 +742,7 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
         assert torch.equal(chunk_msg.data.data, codes)
         assert chunk_msg.data.metadata == {"modality": "audio_codes"}
 
-        await stage._on_stream_signal(
+        await stage.on_stream_signal(
             DataReadyMessage(
                 request_id="req",
                 from_stage="tts_engine",
@@ -428,13 +760,13 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
             request=OmniRequest(inputs="hello"),
             data={"ready": True},
         )
-        await stage._on_data_ready(await _make_relay_payload(relay, payload))
+        await stage.on_data_ready(await make_relay_payload(relay, payload))
         payload_msg = scheduler.inbox.get_nowait()
         assert payload_msg.request_id == "req"
         assert payload_msg.type == "new_request"
         assert payload_msg.data.data == {"ready": True}
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) -> None:
@@ -451,32 +783,32 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
         order.append("routed")
 
     monkeypatch.setattr(CommEngine, "read_stream_chunk", fake_read_stream_chunk)
-    monkeypatch.setattr(Stage, "_route_stream_item_or_fail", fake_route)
+    monkeypatch.setattr(Stage, "route_stream_item_or_fail", fake_route)
     monkeypatch.setattr(
         "sglang_omni.pipeline.stage.runtime._emit_event",
         lambda **kwargs: order.append(kwargs["event_name"]),
     )
 
-    async def _run() -> None:
+    async def run() -> None:
         stage = Stage(
             name="vocoder",
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
             endpoints={"tts_engine": "inproc://tts_engine"},
-            control_plane=_FakeControlPlane(),
-            relay=_FakeRelay(),
+            control_plane=FakeControlPlane(),
+            relay=FakeRelay(),
             scheduler=SimpleNamespace(outbox=queue.Queue()),
             can_accept_stream_before_payload=True,
         )
-        await stage._on_stream_chunk(
+        await stage.on_stream_chunk(
             DataReadyMessage(
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
                 data_ref=(
-                    await _make_relay_chunk(
-                        _FakeRelay(),
+                    await make_relay_chunk(
+                        FakeRelay(),
                         request_id="req",
                         from_stage="tts_engine",
                         to_stage="vocoder",
@@ -488,14 +820,14 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
             )
         )
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
     assert order == ["stream_chunk_read", "stage_stream_chunk_received", "routed"]
 
 
 def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
@@ -509,14 +841,14 @@ def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
             gpu_id=None,
             endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
-            relay=_FakeRelay(),
+            relay=FakeRelay(),
             scheduler=scheduler,
             is_terminal=True,
         )
-        stage._stream_queue = StreamQueue(max_pending=4096)
-        stage._stream_queue.open("req")
+        stage.stream_queue = StreamQueue()
+        stage.stream_queue.open("req")
 
-        await stage._queue_stream_error(
+        await stage.queue_stream_error(
             "req",
             from_stage="thinker",
             error=RuntimeError("stream failed"),
@@ -526,16 +858,54 @@ def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
         assert len(control_plane.completions) == 1
         assert control_plane.completions[0].success is False
         assert control_plane.completions[0].error == "stream failed"
-        assert not stage._stream_queue.has("req")
-        assert "req" in stage._aborted
+        assert not stage.stream_queue.has("req")
+        assert "req" in stage.aborted
 
-    asyncio.run(_run())
+    asyncio.run(run())
+
+
+def test_terminal_request_can_be_readmitted_after_cleanup() -> None:
+    async def run() -> None:
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="vocoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=FakeControlPlane(),
+            relay=FakeRelay(),
+            scheduler=scheduler,
+            can_accept_stream_before_payload=True,
+        )
+        stage.stream_queue = StreamQueue()
+        stage.stream_queue.open("req")
+        stage.active_requests.add("req")
+
+        stage.clear_request_state("req")
+        await stage.receive_local_payload(
+            "req",
+            "tts_engine",
+            StagePayload(request_id="req", request=OmniRequest(inputs=None), data={}),
+        )
+        incoming = scheduler.inbox.get_nowait()
+        assert incoming.request_id == "req"
+        assert incoming.type == "new_request"
+        assert "req" in stage.active_requests
+        assert stage.stream_queue.has("req")
+        assert stage.control_plane.completions == []
+
+    asyncio.run(run())
 
 
 def test_write_stream_chunk_uses_relay() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
+        relay = FakeRelay()
         codes = torch.empty(11, 1, dtype=torch.long)
 
         data_ref, ops = await stage_io.write_stream_chunk(
@@ -570,19 +940,19 @@ def test_write_stream_chunk_uses_relay() -> None:
         data_ref = DataRef.from_dict(msg.data_ref)
         assert data_ref.buffer.info == {"transfer_info": {"size": expected_size}}
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         codes = torch.empty(11, 1, dtype=torch.long)
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
-        relay = _AbortOnReadRelay(lambda: stage._on_abort("req"))
+        relay = AbortOnReadRelay(lambda: stage.on_abort("req"))
         stage = Stage(
             name="vocoder",
             role="single",
@@ -593,10 +963,10 @@ def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
             relay=relay,
             scheduler=scheduler,
         )
-        stage._stream_queue = None
+        stage.stream_queue = None
 
-        await stage._on_stream_chunk(
-            await _make_relay_chunk(
+        await stage.on_stream_chunk(
+            await make_relay_chunk(
                 relay,
                 request_id="req",
                 from_stage="tts_engine",
@@ -609,19 +979,19 @@ def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
         assert scheduler.inbox.empty()
         assert relay.gets == 1
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_drains_relay_stream_chunk_for_already_aborted_request() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         codes = torch.empty(11, 1, dtype=torch.long)
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
-        relay = _AbortOnReadRelay(lambda: None)
+        relay = AbortOnReadRelay(lambda: None)
         stage = Stage(
             name="vocoder",
             role="single",
@@ -632,9 +1002,9 @@ def test_stage_drains_relay_stream_chunk_for_already_aborted_request() -> None:
             relay=relay,
             scheduler=scheduler,
         )
-        stage._aborted.add("req")
-        await stage._on_stream_chunk(
-            await _make_relay_chunk(
+        stage.aborted.add("req")
+        await stage.on_stream_chunk(
+            await make_relay_chunk(
                 relay,
                 request_id="req",
                 from_stage="tts_engine",
@@ -648,18 +1018,18 @@ def test_stage_drains_relay_stream_chunk_for_already_aborted_request() -> None:
         assert scheduler.inbox.empty()
         assert relay.gets == 2
 
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
-        relay = _AbortOnReadRelay(lambda: None)
+        relay = AbortOnReadRelay(lambda: None)
         stage = Stage(
             name="vocoder",
             role="single",
@@ -670,74 +1040,30 @@ def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
             relay=relay,
             scheduler=scheduler,
         )
-        stage._aborted.add("req")
+        stage.aborted.add("req")
         payload = StagePayload(
             request_id="req",
             request=OmniRequest(inputs="hello"),
             data={},
         )
 
-        await stage._on_data_ready(await _make_relay_payload(relay, payload))
+        await stage.on_data_ready(await make_relay_payload(relay, payload))
 
         assert scheduler.inbox.empty()
         assert relay.gets == 1
 
-    asyncio.run(_run())
-
-
-def test_stage_routes_relay_stream_chunk_to_scheduler() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        codes = torch.arange(2048, dtype=torch.float32)
-        scheduler = SimpleNamespace(
-            outbox=queue.Queue(),
-            inbox=queue.Queue(),
-            abort=lambda request_id: None,
-        )
-        relay = ShmRelay(engine_id="t", device="cpu")
-        stage = Stage(
-            name="vocoder",
-            role="single",
-            get_next=lambda request_id, output: None,
-            gpu_id=None,
-            endpoints={"tts_engine": "inproc://tts_engine"},
-            control_plane=control_plane,
-            relay=relay,
-            scheduler=scheduler,
-        )
-        stage._stream_queue = StreamQueue(max_pending=4096)
-        stage._stream_queue.open("req")
-
-        await stage._on_stream_chunk(
-            await _make_relay_chunk(
-                relay,
-                request_id="req",
-                from_stage="tts_engine",
-                to_stage="vocoder",
-                chunk_id=0,
-                data=codes,
-                metadata={"modality": "audio_codes"},
-            )
-        )
-
-        queued = scheduler.inbox.get_nowait()
-        assert queued.request_id == "req"
-        assert queued.type == "stream_chunk"
-        assert torch.equal(queued.data.data, codes)
-        assert queued.data.metadata == {"modality": "audio_codes"}
-
-    asyncio.run(_run())
+    asyncio.run(run())
 
 
 def test_stage_drops_payload_after_abort_during_relay_read() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
+    async def run() -> None:
+        control_plane = FakeControlPlane()
         scheduler = SimpleNamespace(
             outbox=queue.Queue(),
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
-        relay = _AbortOnReadRelay(lambda: stage._on_abort("req"))
+        relay = AbortOnReadRelay(lambda: stage.on_abort("req"))
         stage = Stage(
             name="vocoder",
             role="single",
@@ -754,8 +1080,188 @@ def test_stage_drops_payload_after_abort_during_relay_read() -> None:
             data={},
         )
 
-        await stage._on_data_ready(await _make_relay_payload(relay, payload))
+        await stage.on_data_ready(await make_relay_payload(relay, payload))
 
         assert scheduler.inbox.empty()
 
-    asyncio.run(_run())
+    asyncio.run(run())
+
+
+class RecordingLocalDispatcher(LocalStageDispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chunk_batches: list[tuple[str, list[tuple[str, int]]]] = []
+
+    async def send_stream_chunks(
+        self, *, from_stage: str, to_stage: str, chunks: list[LocalStreamChunk]
+    ) -> None:
+        self.chunk_batches.append(
+            (to_stage, [(chunk.request_id, chunk.chunk_id) for chunk in chunks])
+        )
+        await super().send_stream_chunks(
+            from_stage=from_stage, to_stage=to_stage, chunks=chunks
+        )
+
+
+def make_local_stream_pair(
+    *, targets: tuple[str, ...] = ("vocoder",), accept_before_payload: bool = True
+) -> tuple[RecordingLocalDispatcher, Stage, dict[str, Stage]]:
+    dispatcher = RecordingLocalDispatcher()
+    sender = make_stage(
+        name="tts_engine",
+        endpoints={target: f"inproc://{target}" for target in targets},
+        stream_targets=list(targets),
+        same_process_targets=set(targets),
+        local_dispatcher=dispatcher,
+    )
+    receivers = {
+        target: make_stage(
+            name=target, can_accept_stream_before_payload=accept_before_payload
+        )
+        for target in targets
+    }
+    for receiver in receivers.values():
+        receiver.stream_queue = StreamQueue()
+    dispatcher.register_many([sender, *receivers.values()])
+    return dispatcher, sender, receivers
+
+
+def frame_message(
+    request_id: str, frame: int, target: str = "vocoder"
+) -> OutgoingMessage:
+    return OutgoingMessage(
+        request_id=request_id, type="stream", data=frame, target=target
+    )
+
+
+def test_same_process_stream_run_reaches_the_target_in_one_dispatch() -> None:
+    async def run() -> None:
+        dispatcher, sender, receivers = make_local_stream_pair()
+        sender.active_requests.update({"req-a", "req-b"})
+        put_messages(
+            sender.scheduler.outbox,
+            [
+                frame_message("req-a", 0),
+                frame_message("req-b", 0),
+                frame_message("req-a", 1),
+                frame_message("req-b", 1),
+                OutgoingMessage(request_id="req-a", type="result", data={"ok": 1}),
+            ],
+        )
+
+        sender.end_outbox_drain()
+        await sender.drain_outbox_external()
+
+        assert dispatcher.chunk_batches == [
+            ("vocoder", [("req-a", 0), ("req-b", 0), ("req-a", 1), ("req-b", 1)])
+        ]
+        inbox = receivers["vocoder"].scheduler.inbox
+        delivered = [inbox.get_nowait() for _ in range(5)]
+        assert inbox.empty()
+        assert [(message.request_id, message.type) for message in delivered] == [
+            ("req-a", "stream_chunk"),
+            ("req-b", "stream_chunk"),
+            ("req-a", "stream_chunk"),
+            ("req-b", "stream_chunk"),
+            ("req-a", "stream_done"),
+        ]
+        assert [message.data.data for message in delivered[:4]] == [0, 0, 1, 1]
+        assert {message.data.from_stage for message in delivered[:4]} == {"tts_engine"}
+
+    asyncio.run(run())
+
+
+def test_stream_run_drops_inactive_and_receiver_aborted_requests() -> None:
+    async def run() -> None:
+        dispatcher, sender, receivers = make_local_stream_pair()
+        sender.active_requests.update({"req-a", "req-b"})
+        receivers["vocoder"].aborted.add("req-b")
+        put_messages(
+            sender.scheduler.outbox,
+            [
+                frame_message("req-stale", 0),
+                frame_message("req-a", 0),
+                frame_message("req-b", 0),
+                frame_message("req-a", 1),
+            ],
+        )
+
+        sender.end_outbox_drain()
+        await sender.drain_outbox_external()
+
+        assert dispatcher.chunk_batches == [
+            ("vocoder", [("req-a", 0), ("req-b", 0), ("req-a", 1)])
+        ]
+        assert ("req-stale", "vocoder") not in sender.stream_chunk_counters
+        inbox = receivers["vocoder"].scheduler.inbox
+        delivered = [inbox.get_nowait() for _ in range(2)]
+        assert inbox.empty()
+        assert [(message.request_id, message.data.data) for message in delivered] == [
+            ("req-a", 0),
+            ("req-a", 1),
+        ]
+
+    asyncio.run(run())
+
+
+def test_stream_run_rejects_only_the_request_without_its_payload() -> None:
+    async def run() -> None:
+        _, sender, receivers = make_local_stream_pair(accept_before_payload=False)
+        receiver = receivers["vocoder"]
+        receiver.stream_queue.open("req-a")
+        sender.active_requests.update({"req-a", "req-b"})
+        put_messages(
+            sender.scheduler.outbox,
+            [
+                frame_message("req-a", 0),
+                frame_message("req-b", 0),
+                frame_message("req-a", 1),
+            ],
+        )
+
+        sender.end_outbox_drain()
+        await sender.drain_outbox_external()
+
+        inbox = receiver.scheduler.inbox
+        delivered = [inbox.get_nowait() for _ in range(2)]
+        assert inbox.empty()
+        assert [(message.request_id, message.data.data) for message in delivered] == [
+            ("req-a", 0),
+            ("req-a", 1),
+        ]
+        assert [
+            (completion.request_id, completion.success)
+            for completion in receiver.control_plane.completions
+        ] == [("req-b", False)]
+        assert receiver.scheduler.aborted == ["req-b"]
+
+    asyncio.run(run())
+
+
+def test_stream_run_keeps_the_order_across_alternating_targets() -> None:
+    async def run() -> None:
+        dispatcher, sender, receivers = make_local_stream_pair(
+            targets=("vocoder", "monitor")
+        )
+        sender.active_requests.add("req-a")
+        put_messages(
+            sender.scheduler.outbox,
+            [
+                frame_message("req-a", 0, "vocoder"),
+                frame_message("req-a", 0, "monitor"),
+                frame_message("req-a", 1, "vocoder"),
+            ],
+        )
+
+        sender.end_outbox_drain()
+        await sender.drain_outbox_external()
+
+        assert dispatcher.chunk_batches == [
+            ("vocoder", [("req-a", 0)]),
+            ("monitor", [("req-a", 0)]),
+            ("vocoder", [("req-a", 1)]),
+        ]
+        assert receivers["monitor"].scheduler.inbox.qsize() == 1
+        assert receivers["vocoder"].scheduler.inbox.qsize() == 2
+
+    asyncio.run(run())

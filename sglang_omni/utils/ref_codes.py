@@ -41,7 +41,6 @@ from __future__ import annotations
 import base64
 import binascii
 import sys
-from typing import Any
 
 import torch
 
@@ -56,10 +55,10 @@ REF_CODES_PARAM = "ref_codes"
 # ``serve/openai_api.py`` for the HTTP route (POST /moss/encode_reference).
 ADMIN_ENCODE_REFERENCE = ADMIN_MOSS_ENCODE_REFERENCE
 
-# The codec runs at 12.5 frames/s and stages._MAX_REFERENCE_SECONDS caps an
-# audio reference at 100 s. Mirror that cap in frames so a code payload cannot
-# smuggle in a longer prefix than the audio path would have allowed (importing
-# the constant would be circular: stages imports this module's caller).
+# The codec runs at 12.5 frames/s and reference_encoder.MAX_REFERENCE_SECONDS
+# caps an audio reference at 100 s. Mirror that cap in frames so a code payload
+# cannot smuggle in a longer prefix than the audio path would allow (importing
+# the constant would pull the codec module into the torch-light serve layer).
 _CODEC_FRAMES_PER_SECOND = 12.5
 CODEC_FRAMES_PER_SECOND = _CODEC_FRAMES_PER_SECOND
 _MAX_REFERENCE_SECONDS = 100.0
@@ -78,11 +77,11 @@ _ITEMSIZES: dict[str, int] = {"int16": 2, "uint16": 2, "int32": 4, "uint32": 4}
 _DEFAULT_DTYPE = "int16"
 
 
-def _fail(field: str, message: str) -> None:
-    raise ValueError(f"MOSS-TTS Local {field}: {message}")
+def fail(field: str, message: str) -> None:
+    raise ValueError(f"MOSS-TTS {field}: {message}")
 
 
-def _validate_tensor(
+def validate_tensor(
     codes: torch.Tensor,
     *,
     n_vq: int,
@@ -90,18 +89,18 @@ def _validate_tensor(
     field: str,
 ) -> torch.Tensor:
     if codes.ndim != 2:
-        _fail(field, f"expected a 2-D [T, {n_vq}] array, got ndim={codes.ndim}")
+        fail(field, f"expected a 2-D [T, {n_vq}] array, got ndim={codes.ndim}")
     frames, channels = int(codes.shape[0]), int(codes.shape[1])
     if channels != n_vq:
-        _fail(
+        fail(
             field,
             f"expected shape [T, {n_vq}] (row-major, one row per codec frame), "
             f"got [{frames}, {channels}]",
         )
     if frames < 1:
-        _fail(field, "reference codes must contain at least one frame")
+        fail(field, "reference codes must contain at least one frame")
     if frames > MAX_REFERENCE_CODE_FRAMES:
-        _fail(
+        fail(
             field,
             f"reference is {frames} frames (~{frames / _CODEC_FRAMES_PER_SECOND:.1f}s), "
             f"limit is {MAX_REFERENCE_CODE_FRAMES} frames "
@@ -112,7 +111,7 @@ def _validate_tensor(
     high = int(codes.max())
     # audio_vocab_size itself is the pad code; a reference must not carry pads.
     if low < 0 or high >= audio_vocab_size:
-        _fail(
+        fail(
             field,
             f"codes must lie in [0, {audio_vocab_size - 1}] "
             f"(audio_vocab_size={audio_vocab_size}), got [{low}, {high}]",
@@ -120,43 +119,42 @@ def _validate_tensor(
     return codes.contiguous()
 
 
-def _decode_packed(payload: dict[str, Any], *, field: str) -> torch.Tensor:
+def decode_packed(payload: dict[str, object], *, field: str) -> torch.Tensor:
     data = payload.get("data")
     if data is None:
-        _fail(field, "packed form requires 'data' (base64) and 'shape'")
+        fail(field, "packed form requires 'data' (base64) and 'shape'")
     if not isinstance(data, str):
-        _fail(field, f"'data' must be a base64 string, got {type(data).__name__}")
+        fail(field, f"'data' must be a base64 string, got {type(data).__name__}")
 
     dtype_name = str(payload.get("dtype") or _DEFAULT_DTYPE).lower()
     if dtype_name not in _DTYPES:
-        _fail(
+        fail(
             field,
-            f"unsupported dtype {dtype_name!r}; expected one of "
-            f"{sorted(_DTYPES)}",
+            f"unsupported dtype {dtype_name!r}; expected one of " f"{sorted(_DTYPES)}",
         )
 
     shape = payload.get("shape")
     if not isinstance(shape, (list, tuple)) or len(shape) != 2:
-        _fail(field, f"'shape' must be [T, n_vq], got {shape!r}")
+        fail(field, f"'shape' must be [T, n_vq], got {shape!r}")
     try:
         frames, channels = int(shape[0]), int(shape[1])
     except (TypeError, ValueError):
-        _fail(field, f"'shape' entries must be integers, got {shape!r}")
+        fail(field, f"'shape' entries must be integers, got {shape!r}")
 
     try:
         raw = base64.b64decode(data, validate=True)
     except (binascii.Error, ValueError) as exc:
-        _fail(field, f"'data' is not valid base64 ({exc})")
+        fail(field, f"'data' is not valid base64 ({exc})")
 
     expected = frames * channels * _ITEMSIZES[dtype_name]
     if len(raw) != expected:
-        _fail(
+        fail(
             field,
             f"decoded {len(raw)} bytes but shape {[frames, channels]} at "
             f"{dtype_name} needs {expected}",
         )
     if sys.byteorder != "little":
-        _fail(field, "packed reference codes are little-endian; host is big-endian")
+        fail(field, "packed reference codes are little-endian; host is big-endian")
 
     # bytearray() so torch owns a writable copy (torch.frombuffer refuses to
     # alias an immutable bytes object without a warning).
@@ -165,7 +163,7 @@ def _decode_packed(payload: dict[str, Any], *, field: str) -> torch.Tensor:
 
 
 def decode_reference_codes(
-    raw: Any,
+    raw: object,
     *,
     n_vq: int,
     audio_vocab_size: int,
@@ -182,26 +180,26 @@ def decode_reference_codes(
     if isinstance(raw, torch.Tensor):
         codes = raw
     elif isinstance(raw, dict):
-        codes = _decode_packed(raw, field=field)
+        codes = decode_packed(raw, field=field)
     elif isinstance(raw, (list, tuple)):
         if not raw:
-            _fail(field, "reference codes must contain at least one frame")
+            fail(field, "reference codes must contain at least one frame")
         try:
             codes = torch.tensor(raw, dtype=torch.long)
         except (TypeError, ValueError) as exc:
-            _fail(field, f"nested list form must be [[int, ...], ...] ({exc})")
+            fail(field, f"nested list form must be [[int, ...], ...] ({exc})")
     else:
-        _fail(
+        fail(
             field,
             "must be a packed {'data': base64, 'shape': [T, n_vq]} object or a "
             f"nested int list, got {type(raw).__name__}",
         )
-    return _validate_tensor(
+    return validate_tensor(
         codes, n_vq=n_vq, audio_vocab_size=audio_vocab_size, field=field
     )
 
 
-def encode_reference_codes(codes: torch.Tensor) -> dict[str, Any]:
+def encode_reference_codes(codes: torch.Tensor) -> dict[str, object]:
     """Pack a ``[T, n_vq]`` code tensor into the wire form (offline producers)."""
     if codes.ndim != 2:
         raise ValueError(f"expected a 2-D [T, n_vq] tensor, got ndim={codes.ndim}")

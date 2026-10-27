@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import (
+    EngineStageConfig,
+    PipelineConfig,
+    RealtimeTranscriptionConfig,
+    StageConfig,
+)
+
+from .streaming import FunASRStreamingStrategy
 
 _PKG = "sglang_omni.models.fun_asr"
 
@@ -16,29 +23,37 @@ class FunASRPipelineConfig(PipelineConfig):
         "FunASRNano",
         "FunASRForConditionalGeneration",
     )
+    realtime_transcription: ClassVar[RealtimeTranscriptionConfig] = (
+        RealtimeTranscriptionConfig(
+            strategy_cls=FunASRStreamingStrategy,
+            decode_interval_ms=720,
+            server_vad=True,
+            max_segment_s=30.0,
+        )
+    )
+
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "asr": EngineStageConfig,
+    }
 
     model_path: str
     entry_stage: str = "asr"
     stages: list[StageConfig] = [
-        StageConfig(
+        EngineStageConfig(
             name="asr",
             process="asr",
-            factory=f"{_PKG}.stages.create_sglang_fun_asr_executor",
-            factory_args={
-                "device": "cuda:0",
-                "max_running_requests": 32,
-                "max_new_tokens": 200,
-                "enable_encoder_torch_compile": False,
-                "enable_pre_lm_encoder": True,
-                "pre_lm_cache_max_entries": 4096,
-                "pre_lm_cache_size_bytes": 2 * 1024**3,
-                "request_build_max_workers": 8,
-                "request_build_max_pending": 16,
-            },
+            factory_path=f"{_PKG}.stages.create_sglang_fun_asr_executor",
             gpu=0,
             terminal=True,
         )
     ]
+
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, bool]:
+        if stage_name == "asr":
+            return {"enable_encoder_cuda_graph": True}
+        else:
+            pass
+        return {}
 
 
 EntryClass = FunASRPipelineConfig

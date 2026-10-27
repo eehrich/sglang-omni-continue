@@ -31,6 +31,7 @@ WS_CONTROL_EVENT_TYPES = {
     "response.created",
     "input.ack",
 }
+REQUEST_ID_HEADER = "X-SGLang-Omni-Request-ID"
 UNSUPPORTED_WS_STATUSES = UNSUPPORTED_HTTP_STATUSES
 SUPPORTED_WS_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
 SUPPORTED_WS_SPLIT_GRANULARITIES = {"sentence", "clause"}
@@ -62,7 +63,11 @@ async def run_ws_scenario(
     url = websocket_url(spec.base_url, scenario.path)
     start = time.perf_counter()
     try:
-        async with session.ws_connect(url, max_msg_size=MAX_HTTP_RESPONSE_BYTES) as ws:
+        async with session.ws_connect(
+            url,
+            headers={REQUEST_ID_HEADER: scenario.id},
+            max_msg_size=MAX_HTTP_RESPONSE_BYTES,
+        ) as ws:
             await _run_ws_script(
                 ws,
                 result,
@@ -70,6 +75,7 @@ async def run_ws_scenario(
                 timeout_s=spec.params.timeout_s,
                 expect_success=scenario.expect_success,
                 request_start_s=start,
+                alternate_close=scenario.alternate_ws_close,
             )
         if scenario.capability_key == "ws.disconnect" and result.status == "ok":
             await _probe_websocket_after_disconnect(session, spec, scenario, result)
@@ -118,6 +124,7 @@ async def _run_ws_script(
     timeout_s: int,
     expect_success: bool,
     request_start_s: float | None = None,
+    alternate_close: tuple[int, str] | None = None,
 ) -> None:
     audio_state = WebSocketAudioState(
         request_start_s=request_start_s or time.perf_counter()
@@ -144,6 +151,7 @@ async def _run_ws_script(
                     audio_state,
                     expected_event=str(action.get("event", "")),
                     expect_success=expect_success,
+                    alternate_close=alternate_close,
                 )
                 if not matched:
                     return
@@ -187,6 +195,7 @@ async def _expect_next_event(
     *,
     expected_event: str,
     expect_success: bool,
+    alternate_close: tuple[int, str] | None,
 ) -> bool:
     while True:
         msg = await ws.receive()
@@ -217,7 +226,18 @@ async def _expect_next_event(
             )
             return False
         if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
-            result.ws_close_reason = "server_closed"
+            result.ws_close_code = msg.data if isinstance(msg.data, int) else None
+            result.ws_close_reason = str(msg.extra or "")
+            if (
+                expected_event == "error"
+                and not expect_success
+                and alternate_close == (result.ws_close_code, result.ws_close_reason)
+            ):
+                result.status = "expected_error"
+                result.success = False
+                result.capability = "pass"
+                result.error_class = "expected_client_error"
+                return True
             if expected_event == "close":
                 result.status = "ok"
                 result.success = True
@@ -656,7 +676,11 @@ async def _probe_websocket_after_disconnect(
         response_format="pcm",
     )
     try:
-        async with session.ws_connect(url, max_msg_size=MAX_HTTP_RESPONSE_BYTES) as ws:
+        async with session.ws_connect(
+            url,
+            headers={REQUEST_ID_HEADER: probe_result.scenario_id},
+            max_msg_size=MAX_HTTP_RESPONSE_BYTES,
+        ) as ws:
             await _run_ws_script(
                 ws,
                 probe_result,

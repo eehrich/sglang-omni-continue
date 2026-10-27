@@ -9,21 +9,20 @@ import pytest
 import torch
 
 import sglang_omni.models.fun_asr.request_builders as request_builders
-from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
-    fun_asr_low_frame_rate_length,
-)
+import sglang_omni.preprocessing.transcription as transcription
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.utils.audio import audio_fingerprint
 
-_AUDIO_PAD = "<|object_ref_start|>"
-_AUDIO_PAD_ID = 42  # arbitrary sentinel distinct from vocabulary ids below
+AUDIO_PAD = "<|object_ref_start|>"
+AUDIO_PAD_ID = 42  # arbitrary sentinel distinct from vocabulary ids below
 
 
-class _UnexpectedEncoderService:
-    def encode_item(self, _item: object) -> None:
+class UnexpectedEncoderService:
+    def encode_item(self, item: object) -> None:
         pytest.fail("invalid requests must not be encoded")
 
 
-class _FakeTokenizer:
+class FakeTokenizer:
     eos_token_id = 151645
     vocab_size = 151936
 
@@ -31,18 +30,18 @@ class _FakeTokenizer:
         self.decode_calls: list[dict] = []
 
     def convert_tokens_to_ids(self, token: str) -> int:
-        assert token == _AUDIO_PAD
-        return _AUDIO_PAD_ID
+        assert token == AUDIO_PAD
+        return AUDIO_PAD_ID
 
     def __call__(self, text: str, *, add_special_tokens: bool = False):
         assert not add_special_tokens
         # Mirror the real ChatML prompt shape: a fixed head/tail with N audio
         # placeholders in the middle. The request builder only inspects the
         # placeholder span, so the surrounding text need not be real tokens.
-        audio_pad_count = text.count(_AUDIO_PAD)
+        audio_pad_count = text.count(AUDIO_PAD)
         # system(3) + user-open(2) + [pad]*N + user-close/assistant(4)
         input_ids = (
-            [10, 11, 12, 13, 14] + [_AUDIO_PAD_ID] * audio_pad_count + [15, 16, 17, 18]
+            [10, 11, 12, 13, 14] + [AUDIO_PAD_ID] * audio_pad_count + [15, 16, 17, 18]
         )
         return SimpleNamespace(input_ids=input_ids)
 
@@ -67,10 +66,10 @@ class _FakeTokenizer:
         return text
 
 
-def _feature_extractor(num_lfr_frames: int):
+def feature_extractor(num_lfr_frames: int):
     """Stand-in for FunAsrNanoFeatureExtractor: returns [1, 560, T_lfr]."""
 
-    def _call(
+    def call(
         audio,
         sampling_rate=None,
         return_tensors=None,
@@ -82,24 +81,25 @@ def _feature_extractor(num_lfr_frames: int):
             "attention_mask": torch.ones((1, num_lfr_frames), dtype=torch.long),
         }
 
-    return _call
+    return call
 
 
-def test_fun_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) -> None:
-    # 17 LFR frames -> three ceil(x/2) reductions: 17->9->5->3 audio tokens
+def test_fun_asr_request_builder_records_inclusive_audio_offsets(
+    monkeypatch,
+) -> None:
     num_lfr_frames = 17
-    num_audio_tokens = fun_asr_low_frame_rate_length(num_lfr_frames)
-    assert num_audio_tokens == 3
+    num_audio_tokens = 3
+    extractor = feature_extractor(num_lfr_frames)
 
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(1600 * 3, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600 * 3, dtype=np.float32),
     )
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_FakeTokenizer(),
+        tokenizer=FakeTokenizer(),
         max_new_tokens=32,
-        feature_extractor=_feature_extractor(num_lfr_frames),
+        feature_extractor=extractor,
     )
     payload = StagePayload(
         request_id="req-fun-asr",
@@ -121,7 +121,7 @@ def test_fun_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) ->
     )
     # pad_value replaces the placeholder span (general_mm_embed_routine matches it
     # by pad_value, not by the original <|object_ref_start|> token id)
-    assert audio_item.pad_value != _AUDIO_PAD_ID
+    assert audio_item.pad_value != AUDIO_PAD_ID
     # greedy by default (Fun-ASR reference uses no sampling args): temperature=0.0
     # is normalized by sglang to top_k=1. The original intent is on FunASRRequestData.
     assert data.temperature == 0.0
@@ -138,10 +138,10 @@ def test_fun_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) ->
 
 def test_fun_asr_request_builder_encodes_after_offsets_are_final(monkeypatch) -> None:
     audio = np.zeros(1600, dtype=np.float32)
-    monkeypatch.setattr(request_builders, "_load_audio", lambda source: audio)
+    monkeypatch.setattr(transcription, "load_audio", lambda source, **kwargs: audio)
     observed: dict[str, object] = {}
 
-    class _EncoderService:
+    class EncoderService:
         def encode_item(self, item) -> None:
             observed["offsets"] = item.offsets
             observed["num_audio_tokens"] = item.num_audio_tokens
@@ -150,10 +150,10 @@ def test_fun_asr_request_builder_encodes_after_offsets_are_final(monkeypatch) ->
             item.feature = None
 
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_FakeTokenizer(),
+        tokenizer=FakeTokenizer(),
         max_new_tokens=16,
-        feature_extractor=_feature_extractor(17),
-        audio_encoder_service=_EncoderService(),
+        feature_extractor=feature_extractor(17),
+        audio_encoder_service=EncoderService(),
     )
     payload = StagePayload(
         request_id="req-fun-asr-pre-lm",
@@ -166,7 +166,7 @@ def test_fun_asr_request_builder_encodes_after_offsets_are_final(monkeypatch) ->
     item = data.req.multimodal_inputs.mm_items[0]
     assert observed["offsets"] == item.offsets
     assert observed["num_audio_tokens"] == 3
-    assert observed["audio_fingerprint"] == request_builders.audio_fingerprint(audio)
+    assert observed["audio_fingerprint"] == audio_fingerprint(audio)
     assert item.feature is None
     assert item.precomputed_embeddings.shape[0] == 3
 
@@ -174,21 +174,21 @@ def test_fun_asr_request_builder_encodes_after_offsets_are_final(monkeypatch) ->
 def test_fun_asr_request_builder_language_prompt(monkeypatch) -> None:
 
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(1600, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
     )
     captured = {}
 
-    class _CapturingTokenizer(_FakeTokenizer):
+    class CapturingTokenizer(FakeTokenizer):
         def __call__(self, text: str, *, add_special_tokens: bool = False):
             captured["prompt_text"] = text
             return super().__call__(text, add_special_tokens=add_special_tokens)
 
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_CapturingTokenizer(),
+        tokenizer=CapturingTokenizer(),
         max_new_tokens=16,
-        feature_extractor=_feature_extractor(11),
+        feature_extractor=feature_extractor(11),
     )
     payload = StagePayload(
         request_id="req-fun-asr-en",
@@ -202,7 +202,7 @@ def test_fun_asr_request_builder_language_prompt(monkeypatch) -> None:
 
 
 def test_fun_asr_result_adapter_decodes_transcript_directly() -> None:
-    tokenizer = _FakeTokenizer()
+    tokenizer = FakeTokenizer()
     _, result_adapter = request_builders.make_fun_asr_scheduler_adapters(
         tokenizer=tokenizer,
         max_new_tokens=32,
@@ -246,15 +246,25 @@ def test_fun_asr_load_audio_uses_shared_audio_utility(monkeypatch) -> None:
     calls = []
     expected = np.zeros(1600, dtype=np.float32)
 
-    def _shared(source, **kwargs):
+    def shared(source, **kwargs):
         calls.append((source, kwargs))
         return expected
 
-    monkeypatch.setattr(request_builders, "_shared_load_audio", _shared)
+    monkeypatch.setattr(transcription, "load_audio", shared)
 
-    actual = request_builders._load_audio(b"wav")
+    request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
+        tokenizer=FakeTokenizer(),
+        max_new_tokens=16,
+        feature_extractor=feature_extractor(17),
+    )
+    payload = StagePayload(
+        request_id="req-fun-asr-shared-load",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
 
-    assert actual is expected
+    request_builder(payload)
+
     assert calls == [
         (
             b"wav",
@@ -265,14 +275,14 @@ def test_fun_asr_load_audio_uses_shared_audio_utility(monkeypatch) -> None:
 
 def test_fun_asr_request_builder_scales_default_token_budget(monkeypatch) -> None:
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(16000 * 3, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000 * 3, dtype=np.float32),
     )
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_FakeTokenizer(),
+        tokenizer=FakeTokenizer(),
         max_new_tokens=200,
-        feature_extractor=_feature_extractor(17),
+        feature_extractor=feature_extractor(17),
     )
     payload = StagePayload(
         request_id="req-fun-asr-budget",
@@ -288,14 +298,14 @@ def test_fun_asr_request_builder_scales_default_token_budget(monkeypatch) -> Non
 
 def test_fun_asr_request_builder_rejects_audio_over_vad_limit(monkeypatch) -> None:
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(16000 * 30 + 1, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000 * 30 + 1, dtype=np.float32),
     )
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_FakeTokenizer(),
+        tokenizer=FakeTokenizer(),
         max_new_tokens=200,
-        feature_extractor=_feature_extractor(17),
+        feature_extractor=feature_extractor(17),
     )
     payload = StagePayload(
         request_id="req-fun-asr-too-long",
@@ -307,19 +317,43 @@ def test_fun_asr_request_builder_rejects_audio_over_vad_limit(monkeypatch) -> No
         request_builder(payload)
 
 
+def test_fun_asr_request_builder_enforces_scheduler_request_limits(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
+        tokenizer=FakeTokenizer(),
+        max_new_tokens=16,
+        feature_extractor=feature_extractor(17),
+    )
+    payload = StagePayload(
+        request_id="req-fun-asr-request-limits",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}, params={}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    assert data.enforce_request_limits is True
+
+
 def test_fun_asr_request_builder_rejects_explicit_token_budget_over_cap(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(16000, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000, dtype=np.float32),
     )
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_FakeTokenizer(),
+        tokenizer=FakeTokenizer(),
         max_new_tokens=200,
-        feature_extractor=_feature_extractor(17),
-        audio_encoder_service=_UnexpectedEncoderService(),
+        feature_extractor=feature_extractor(17),
+        audio_encoder_service=UnexpectedEncoderService(),
     )
     payload = StagePayload(
         request_id="req-fun-asr-token-cap",
@@ -339,21 +373,21 @@ def test_fun_asr_request_builder_wraps_string_hotword_as_single_entry(
 ) -> None:
     # A bare string must stay one hotword, not be split into characters.
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(1600, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
     )
     captured = {}
 
-    class _CapturingTokenizer(_FakeTokenizer):
+    class CapturingTokenizer(FakeTokenizer):
         def __call__(self, text: str, *, add_special_tokens: bool = False):
             captured["prompt_text"] = text
             return super().__call__(text, add_special_tokens=add_special_tokens)
 
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_CapturingTokenizer(),
+        tokenizer=CapturingTokenizer(),
         max_new_tokens=16,
-        feature_extractor=_feature_extractor(11),
+        feature_extractor=feature_extractor(11),
     )
     payload = StagePayload(
         request_id="req-fun-asr-hotwords-str",
@@ -368,6 +402,54 @@ def test_fun_asr_request_builder_wraps_string_hotword_as_single_entry(
     assert "热词列表：[人工智能]" in captured["prompt_text"]
 
 
+def capture_prompt_text(monkeypatch, params):
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    captured = {}
+
+    class CapturingTokenizer(FakeTokenizer):
+        def __call__(self, text: str, *, add_special_tokens: bool = False):
+            captured["prompt_text"] = text
+            return super().__call__(text, add_special_tokens=add_special_tokens)
+
+    request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
+        tokenizer=CapturingTokenizer(),
+        max_new_tokens=16,
+        feature_extractor=feature_extractor(11),
+    )
+    request_builder(
+        StagePayload(
+            request_id="req-fun-asr-prompt",
+            request=OmniRequest(inputs={"audio_path": "x.wav"}, params=params),
+            data={},
+        )
+    )
+    return captured["prompt_text"]
+
+
+def test_fun_asr_prompt_field_feeds_the_hotword_list(monkeypatch) -> None:
+    """The endpoint sends vocabulary hints as ``prompt``, not ``hotwords``.
+
+    Without the fallback the hint is silently dropped and biasing is
+    unreachable over HTTP.
+    """
+    text = capture_prompt_text(monkeypatch, {"prompt": "PyTorch, nginx, Kubernetes"})
+
+    assert "热词列表：[PyTorch, nginx, Kubernetes]" in text
+
+
+def test_fun_asr_explicit_hotwords_take_precedence_over_prompt(monkeypatch) -> None:
+    text = capture_prompt_text(
+        monkeypatch, {"hotwords": ["人工智能"], "prompt": "PyTorch"}
+    )
+
+    assert "热词列表：[人工智能]" in text
+    assert "PyTorch" not in text
+
+
 def test_fun_asr_request_builder_rejects_prompt_overrun_of_context_length(
     monkeypatch,
 ) -> None:
@@ -375,16 +457,16 @@ def test_fun_asr_request_builder_rejects_prompt_overrun_of_context_length(
     # With context_length=10 and max_new_tokens=5, 12 + 5 > 10 must raise a
     # clear bad-request error (caught by _BAD_REQUEST_MARKERS -> HTTP 400).
     monkeypatch.setattr(
-        request_builders,
-        "_load_audio",
-        lambda source: np.zeros(16000, dtype=np.float32),
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000, dtype=np.float32),
     )
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
-        tokenizer=_FakeTokenizer(),
+        tokenizer=FakeTokenizer(),
         max_new_tokens=200,
-        feature_extractor=_feature_extractor(17),
+        feature_extractor=feature_extractor(17),
         context_length=10,
-        audio_encoder_service=_UnexpectedEncoderService(),
+        audio_encoder_service=UnexpectedEncoderService(),
     )
     payload = StagePayload(
         request_id="req-fun-asr-overflow",
@@ -397,3 +479,42 @@ def test_fun_asr_request_builder_rejects_prompt_overrun_of_context_length(
 
     with pytest.raises(ValueError, match=r"longer than the model's context length"):
         request_builder(payload)
+
+
+def test_apple_rejects_sampling_before_preprocessing(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("sampling rejection must precede audio loading")
+
+    monkeypatch.setattr(request_builders, "prepare_audio", unexpected)
+    build, _ = request_builders.make_fun_asr_scheduler_adapters(
+        tokenizer=FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=feature_extractor(17),
+        greedy_only=True,
+    )
+    payload = StagePayload(
+        request_id="sampling",
+        request=OmniRequest(
+            inputs={"audio_bytes": b"wav"}, params={"temperature": 0.5}
+        ),
+        data={},
+    )
+    with pytest.raises(ValueError, match="greedy"):
+        build(payload)
+
+
+def test_apple_sampling_error_is_an_http_bad_request():
+    from sglang_omni.serve.openai_errors import is_bad_request_error
+
+    assert is_bad_request_error(
+        RuntimeError("Fun-ASR Apple currently requires temperature=0 (greedy decoding)")
+    )
+    assert not is_bad_request_error(RuntimeError("Fun-ASR model execution failed"))
+
+
+@pytest.mark.parametrize("model", ["Fun-ASR", "Qwen3-ASR"])
+def test_audio_decode_error_survives_pipeline_error_serialization(model):
+    from sglang_omni.serve.openai_errors import is_bad_request_error
+
+    assert is_bad_request_error(RuntimeError(f"Could not decode {model} audio input"))
+    assert not is_bad_request_error(RuntimeError("Could not decode model weights"))

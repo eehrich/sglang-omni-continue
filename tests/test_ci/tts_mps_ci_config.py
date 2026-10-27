@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Raw pre-slack references and derived gates for TTS MPS DP2 validation."""
+
+from __future__ import annotations
+
+from typing import Any
+
+# Same uniform slack the TTS generation stages use.
+MPS_SLACK_HIGHER = 0.75
+MPS_SLACK_LOWER = 1.25
+
+MPS_CONCURRENCY = 16
+
+MPS_HIGGS_THROUGHPUT_QPS_REF: float | None = 16.22
+MPS_HIGGS_OUTPUT_TOK_PER_REQ_S_REF: float | None = 120.9
+MPS_HIGGS_LATENCY_MEAN_S_REF: float | None = 0.981
+MPS_HIGGS_RTF_MEAN_REF: float | None = 0.2322
+
+MPS_MOSS_THROUGHPUT_QPS_REF: float | None = 19.595
+MPS_MOSS_OUTPUT_TOK_PER_REQ_S_REF: float | None = 79.7
+MPS_MOSS_LATENCY_MEAN_S_REF: float | None = 0.811
+MPS_MOSS_RTF_MEAN_REF: float | None = 0.1863
+
+# Speaker similarity gets its own MPS baseline. The canonical reference is
+# calibrated under ordinary DP2, and under a shared card the observed spread
+# straddles it (65.90 to 67.31 against a 66.07 line), so reusing it would make
+# the stage fail about half the time without any measured MPS penalty.
+MPS_HIGGS_SIMILARITY_MEAN_MIN: float | None = 64.5785757446289
+MPS_MOSS_SIMILARITY_MEAN_MIN: float | None = 62.4948962020874
+
+MPS_SIMILARITY_MEAN_MIN = {
+    "higgs": MPS_HIGGS_SIMILARITY_MEAN_MIN,
+    "moss": MPS_MOSS_SIMILARITY_MEAN_MIN,
+}
+
+# Note (Jiaxin Deng): a 50-sample similarity mean swings ~0.7 points run to run
+# (same under plain DP2), so the bare worst-of-five floor failed ~1/3 of runs.
+MPS_SIMILARITY_SLACK = 0.97
+
+MINIMUM = "minimum"
+MAXIMUM = "maximum"
+
+MPS_PERFORMANCE_REFERENCES: dict[str, dict[str, tuple[float | None, str, str]]] = {
+    "higgs": {
+        "throughput_qps": (MPS_HIGGS_THROUGHPUT_QPS_REF, MINIMUM, "req/s"),
+        "output_tok_per_req_s": (
+            MPS_HIGGS_OUTPUT_TOK_PER_REQ_S_REF,
+            MINIMUM,
+            "tok/req-s",
+        ),
+        "latency_mean_s": (MPS_HIGGS_LATENCY_MEAN_S_REF, MAXIMUM, "s"),
+        "rtf_mean": (MPS_HIGGS_RTF_MEAN_REF, MAXIMUM, ""),
+    },
+    "moss": {
+        "throughput_qps": (MPS_MOSS_THROUGHPUT_QPS_REF, MINIMUM, "req/s"),
+        "output_tok_per_req_s": (
+            MPS_MOSS_OUTPUT_TOK_PER_REQ_S_REF,
+            MINIMUM,
+            "tok/req-s",
+        ),
+        "latency_mean_s": (MPS_MOSS_LATENCY_MEAN_S_REF, MAXIMUM, "s"),
+        "rtf_mean": (MPS_MOSS_RTF_MEAN_REF, MAXIMUM, ""),
+    },
+}
+
+
+def derive_threshold(reference: float, direction: str) -> float:
+    """Apply CI slack to a stored pre-slack reference."""
+    if direction == MINIMUM:
+        return reference * MPS_SLACK_HIGHER
+    return reference * MPS_SLACK_LOWER
+
+
+def similarity_floor(model: str) -> float | None:
+    """Apply CI slack to the stored pre-slack speaker-similarity reference."""
+    reference = MPS_SIMILARITY_MEAN_MIN[model]
+    if reference is None:
+        return None
+    return reference * MPS_SIMILARITY_SLACK
+
+
+def check_mps_performance(
+    *,
+    model: str,
+    concurrency: int,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare an observed benchmark summary against the calibrated references."""
+    references = MPS_PERFORMANCE_REFERENCES.get(model)
+    if references is None:
+        raise ValueError(f"unsupported MPS performance model {model!r}")
+    if concurrency != MPS_CONCURRENCY:
+        raise ValueError(
+            f"MPS performance references require concurrency {MPS_CONCURRENCY}"
+        )
+
+    checks: dict[str, Any] = {}
+    failed: list[str] = []
+    uncalibrated: list[str] = []
+    for metric, (reference, direction, unit) in references.items():
+        observed = summary.get(metric)
+        if not isinstance(observed, (int, float)):
+            failed.append(f"{metric} missing from benchmark summary")
+            continue
+        if reference is None:
+            uncalibrated.append(metric)
+            checks[metric] = {
+                "observed": observed,
+                "reference": None,
+                "threshold": None,
+                "direction": direction,
+                "unit": unit,
+                "pass": False,
+            }
+            continue
+        threshold = derive_threshold(reference, direction)
+        passed = (
+            observed >= threshold if direction == MINIMUM else observed <= threshold
+        )
+        checks[metric] = {
+            "observed": observed,
+            "reference": reference,
+            "threshold": threshold,
+            "direction": direction,
+            "unit": unit,
+            "pass": passed,
+        }
+        if not passed:
+            comparator = ">=" if direction == MINIMUM else "<="
+            failed.append(
+                f"{metric} {observed:.4f}{unit} violates {comparator} "
+                f"{threshold:.4f}{unit} (reference {reference:.4f}{unit})"
+            )
+
+    total = summary.get("total_requests")
+    if (
+        not isinstance(total, int)
+        or total <= 0
+        or summary.get("completed_requests") != total
+        or summary.get("failed_requests") != 0
+    ):
+        failed.append("request_completion")
+
+    if uncalibrated:
+        failed.append(
+            "uncalibrated performance references: "
+            + ", ".join(sorted(uncalibrated))
+            + "; run calibrate-h100-ci from sglang-omni-calibration with 5 repeats"
+        )
+    return {
+        "status": "pass" if not failed else "fail",
+        "model": model,
+        "concurrency": concurrency,
+        "checks": checks,
+        "failed_checks": failed,
+        "uncalibrated": sorted(uncalibrated),
+    }

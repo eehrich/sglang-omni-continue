@@ -3,109 +3,87 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from typing import Literal
+
+from sglang_omni.models.whisper_asr.config import WhisperASRFactoryArgs
 
 
 def create_sglang_whisper_asr_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    encoder_attention_backend: Literal["auto", "sdpa", "fa4"] | None = None,
+    device: str | None = None,
+    gpu_id: int | None = None,
     dtype: str = "float16",
-    max_running_requests: int = 16,
+    max_running_requests: int = 64,
     max_new_tokens: int = 256,
+    stream_emit_interval_s: float = 0.05,
     mem_fraction_static: float = 0.85,
-    server_args_overrides: dict[str, Any] | None = None,
+    enable_encoder_cuda_graph: bool = False,
+    enable_dense_prefill_cuda_graph: bool = False,
+    cpu_intra_op_threads: int | None = None,
+    encoder_graph_batch_buckets: list[int] | None = None,
+    request_build_max_workers: int = 8,
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 1,
+    request_build_max_pending: int | None = 16,
+    prefill_coalesce_requests: int = 2,
+    prefill_coalesce_wait_ms: float = 6.0,
+    prefill_coalesce_when_idle: bool = True,
+    prefill_coalesce_requires_pending_builds: bool = True,
+    prefill_coalesce_after_builds_during_decode: bool = False,
+    pre_lm_pipeline_batches: bool = False,
+    enable_pre_lm_encoder: bool = True,
+    pre_lm_cache_max_entries: int = 1024,
+    pre_lm_cache_size_bytes: int | None = None,
+    pre_lm_max_batch_size: int = 8,
+    pre_lm_max_batch_wait_ms: int = 0,
+    pre_lm_cache_pin_host_memory: bool = True,
+    server_args_overrides: Mapping[str, object] | None = None,
 ):
-    from transformers import AutoProcessor, GenerationConfig
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
 
-    from sglang_omni.model_runner.base import ModelRunner
-    from sglang_omni.models.whisper_asr.request_builders import (
-        make_whisper_scheduler_adapters,
-    )
-    from sglang_omni.scheduling.bootstrap import (
-        create_sglang_infrastructure_defer_cuda_graph,
-    )
-    from sglang_omni.scheduling.generation_batch_policy import (
-        build_generation_batch_overrides,
-        validate_generation_batch_policy,
-    )
-    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-    from sglang_omni.scheduling.sglang_backend import (
-        SGLangOutputProcessor,
-        build_sglang_server_args,
-    )
-
-    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
-    processor = AutoProcessor.from_pretrained(model_path)
-    tokenizer = processor.tokenizer
-    generation_config = GenerationConfig.from_pretrained(model_path)
-    encoder_token_count = int(processor.feature_extractor.nb_max_frames // 2)
-
-    overrides = build_generation_batch_overrides(
+    if encoder_attention_backend is None:
+        encoder_attention_backend = WhisperASRFactoryArgs().encoder_attention_backend
+    else:
+        pass
+    return WhisperASREngineBuilder(
+        encoder_attention_backend=encoder_attention_backend,
         max_running_requests=max_running_requests,
-        server_args_overrides=server_args_overrides,
-        disable_cuda_graph=False,
-        disable_overlap_schedule=True,
-        enable_torch_compile=True,
         mem_fraction_static=mem_fraction_static,
-        max_prefill_tokens=4096,
-        chunked_prefill_size=4096,
-        sampling_backend="pytorch",
-        dtype=dtype,
-    )
-
-    server_args = build_sglang_server_args(
-        model_path,
-        context_length=encoder_token_count + int(max_new_tokens) + 8,
-        **overrides,
-    )
-    validate_generation_batch_policy(
-        model_name="Whisper ASR",
-        server_args=server_args,
-    )
-
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
-    ) = create_sglang_infrastructure_defer_cuda_graph(
-        server_args,
-        gpu_id,
-        model_arch_override="WhisperForConditionalGeneration",
-    )
-
-    if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
-
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model_worker.model_runner.model,
-    )
-    request_builder, result_adapter = make_whisper_scheduler_adapters(
-        processor=processor,
-        tokenizer=tokenizer,
-        generation_config=generation_config,
-        encoder_token_count=encoder_token_count,
         max_new_tokens=max_new_tokens,
-    )
-
-    return OmniScheduler(
-        tp_worker=model_worker,
-        tree_cache=tree_cache,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        server_args=server_args,
-        model_config=model_config,
-        prefill_manager=prefill_mgr,
-        decode_manager=decode_mgr,
-        model_runner=ModelRunner(model_worker, output_proc),
-        request_builder=request_builder,
-        result_adapter=result_adapter,
+        stream_emit_interval_s=stream_emit_interval_s,
+        enable_encoder_cuda_graph=enable_encoder_cuda_graph,
+        enable_dense_prefill_cuda_graph=enable_dense_prefill_cuda_graph,
+        cpu_intra_op_threads=cpu_intra_op_threads,
+        encoder_graph_batch_buckets=encoder_graph_batch_buckets,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
+        request_build_max_workers=request_build_max_workers,
+        request_build_max_pending=request_build_max_pending,
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        prefill_coalesce_requires_pending_builds=(
+            prefill_coalesce_requires_pending_builds
+        ),
+        prefill_coalesce_after_builds_during_decode=(
+            prefill_coalesce_after_builds_during_decode
+        ),
+        pre_lm_pipeline_batches=pre_lm_pipeline_batches,
+        enable_pre_lm_encoder=enable_pre_lm_encoder,
+        pre_lm_cache_max_entries=pre_lm_cache_max_entries,
+        pre_lm_cache_size_bytes=pre_lm_cache_size_bytes,
+        pre_lm_max_batch_size=pre_lm_max_batch_size,
+        pre_lm_max_batch_wait_ms=pre_lm_max_batch_wait_ms,
+        pre_lm_cache_pin_host_memory=pre_lm_cache_pin_host_memory,
+    ).build(
+        model_path,
+        device=device,
+        gpu_id=gpu_id,
+        dtype=dtype,
+        server_args_overrides=server_args_overrides,
     )
 
 

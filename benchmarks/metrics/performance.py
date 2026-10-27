@@ -29,6 +29,13 @@ Metric semantics:
     to first decoded audio chunk arrival. Streaming only.
 ``audio_ttfp_median_s`` / ``audio_ttfp_p95_s`` / ``audio_ttfp_p99_s``
     Median / tail percentiles of TTFC.
+``audio_ttfp_from_arrival_median_s`` / ``_p95_s`` / ``_p99_s``
+    TTFC measured from each request's planned open-loop arrival instead of
+    its send, so a client that sends late cannot hide that delay. Open-loop
+    streaming runs only.
+``dispatch_lateness_p50_s`` / ``dispatch_lateness_p99_s`` / ``dispatch_lateness_max_s``
+    How long after its planned arrival each request was actually sent,
+    client-side slot waits included. Open-loop runs only.
 ``text_ttft_mean_s`` (TTFT)
     Mean time-to-first-text-token: client-side wall time from request send to
     first non-empty content delta. Streaming only; populated when the model
@@ -40,6 +47,15 @@ Metric semantics:
     request. Streaming smoothness metric.
 ``inter_chunk_p95_s`` / ``inter_chunk_p99_s``
     Tail percentiles of inter-chunk latency (streaming jitter).
+``max_playback_underrun_mean_s`` / ``max_playback_underrun_p95_s`` /
+``max_playback_underrun_p99_s``
+    Maximum client-side playback starvation for streaming audio requests.
+``c50`` / ``c100`` / ``c200``
+    Percent of multi-chunk streams whose maximum playback underrun is at most
+    50 / 100 / 200 ms. Single-chunk streams are reported as N/A.
+``playback_continuity_requests`` / ``playback_continuity_na_requests``
+    Scored versus N/A requests behind the ``c*`` gates. All the fields above are
+    emitted only for workloads that stream audio chunks.
 ``audio_chunks_mean``
     Mean number of audio chunks observed per successful streaming request.
     For raw PCM streaming, HTTP chunk boundaries are preserved when available
@@ -57,7 +73,7 @@ import os
 
 import numpy as np
 
-from benchmarks.benchmarker.data import RequestResult
+from benchmarks.benchmarker.data import FinishReason, RequestResult
 from benchmarks.metrics._format import (
     SPEED_LABEL_WIDTH,
     SPEED_LINE_WIDTH,
@@ -65,6 +81,7 @@ from benchmarks.metrics._format import (
     print_benchmark_dataset_line,
     print_speed_metric_line,
 )
+from benchmarks.metrics.playback_continuity import summarize_playback_continuity
 
 
 def _compute_token_metrics(
@@ -105,12 +122,19 @@ def compute_speed_metrics(
     outputs: list[RequestResult], wall_clock_s: float | None = None
 ) -> dict:
     """Compute system performance summary from a list of request results."""
+    # note (Yucheng Hu): generations that ended at their max-token cap, out of
+    # those that reported how they ended; a cap hit is not by itself a runaway.
+    finish_reasons = [
+        o.finish_reason for o in outputs if o.finish_reason is not FinishReason.UNKNOWN
+    ]
     successes = [o for o in outputs if o.is_success]
     if not successes:
         return {
             "total_requests": len(outputs),
             "completed_requests": 0,
             "failed_requests": len(outputs),
+            "max_token_hits": finish_reasons.count(FinishReason.LENGTH),
+            "finish_reason_observed": len(finish_reasons),
         }
 
     latencies = [o.latency_s for o in successes]
@@ -124,6 +148,14 @@ def compute_speed_metrics(
     text_ttfts = [
         o.text_ttft_s for o in successes if getattr(o, "text_ttft_s", None) is not None
     ]
+    lateness = [
+        o.dispatch_lateness_s for o in successes if o.dispatch_lateness_s is not None
+    ]
+    ttfps_from_arrival = [
+        o.audio_ttfp_s + o.dispatch_lateness_s
+        for o in successes
+        if o.audio_ttfp_s is not None and o.dispatch_lateness_s is not None
+    ]
     inter_chunk_deltas = [
         d for o in successes for d in getattr(o, "inter_chunk_s", []) or []
     ]
@@ -134,6 +166,11 @@ def compute_speed_metrics(
         o.first_audio_payload_bytes
         for o in successes
         if getattr(o, "first_audio_payload_bytes", 0) > 0
+    ]
+    streaming_audio_underruns = [
+        getattr(o, "max_playback_underrun_s", None)
+        for o in successes
+        if getattr(o, "chunk_audio_duration_s", None)
     ]
 
     if wall_clock_s is not None and wall_clock_s > 0:
@@ -148,6 +185,11 @@ def compute_speed_metrics(
         "total_requests": len(outputs),
         "completed_requests": len(successes),
         "failed_requests": len(outputs) - len(successes),
+        "max_token_hits": finish_reasons.count(FinishReason.LENGTH),
+        "finish_reason_observed": len(finish_reasons),
+        "client_slot_waits": sum(
+            1 for o in outputs if getattr(o, "waited_for_slot", False)
+        ),
         "latency_mean_s": round(float(np.mean(latencies)), 3),
         "latency_median_s": round(float(np.median(latencies)), 3),
         "latency_p95_s": round(float(np.percentile(latencies, 95)), 3),
@@ -172,6 +214,21 @@ def compute_speed_metrics(
         metrics_summary["audio_ttfp_median_s"] = round(float(np.median(ttfps)), 4)
         metrics_summary["audio_ttfp_p95_s"] = round(float(np.percentile(ttfps, 95)), 4)
         metrics_summary["audio_ttfp_p99_s"] = round(float(np.percentile(ttfps, 99)), 4)
+    if ttfps_from_arrival:
+        for key, value in (
+            ("median", np.median(ttfps_from_arrival)),
+            ("p95", np.percentile(ttfps_from_arrival, 95)),
+            ("p99", np.percentile(ttfps_from_arrival, 99)),
+        ):
+            metrics_summary[f"audio_ttfp_from_arrival_{key}_s"] = round(float(value), 4)
+    if lateness:
+        metrics_summary["dispatch_lateness_p50_s"] = round(
+            float(np.median(lateness)), 4
+        )
+        metrics_summary["dispatch_lateness_p99_s"] = round(
+            float(np.percentile(lateness, 99)), 4
+        )
+        metrics_summary["dispatch_lateness_max_s"] = round(float(max(lateness)), 4)
     if text_ttfts:
         metrics_summary["text_ttft_mean_s"] = round(float(np.mean(text_ttfts)), 4)
         metrics_summary["text_ttft_median_s"] = round(float(np.median(text_ttfts)), 4)
@@ -205,6 +262,8 @@ def compute_speed_metrics(
         metrics_summary["first_audio_payload_bytes_p95"] = round(
             float(np.percentile(first_payload_bytes, 95)), 1
         )
+    if streaming_audio_underruns:
+        metrics_summary.update(summarize_playback_continuity(streaming_audio_underruns))
     return metrics_summary
 
 
@@ -226,6 +285,10 @@ def print_speed_summary(
         print(f"  {'Concurrency:':<{lw}} {concurrency}")
     print(f"  {'Completed requests:':<{lw}} {metrics['completed_requests']}")
     print(f"  {'Failed requests:':<{lw}} {metrics['failed_requests']}")
+    print_speed_metric_line(lw, "Max token hits:", metrics, "max_token_hits")
+    print_speed_metric_line(
+        lw, "Finish reasons observed:", metrics, "finish_reason_observed"
+    )
     print(f"{'-' * w}")
     print_speed_metric_line(lw, "Latency mean (s):", metrics, "latency_mean_s")
     print_speed_metric_line(lw, "Latency median (s):", metrics, "latency_median_s")
@@ -252,6 +315,27 @@ def print_speed_summary(
     print_speed_metric_line(lw, "ITL mean (s):", metrics, "inter_chunk_mean_s")
     print_speed_metric_line(lw, "ITL p95 (s):", metrics, "inter_chunk_p95_s")
     print_speed_metric_line(lw, "ITL p99 (s):", metrics, "inter_chunk_p99_s")
+    print_speed_metric_line(
+        lw, "Max underrun mean (s):", metrics, "max_playback_underrun_mean_s"
+    )
+    print_speed_metric_line(
+        lw, "Max underrun p95 (s):", metrics, "max_playback_underrun_p95_s"
+    )
+    print_speed_metric_line(
+        lw, "Max underrun p99 (s):", metrics, "max_playback_underrun_p99_s"
+    )
+    print_speed_metric_line(lw, "C50 (%):", metrics, "c50")
+    print_speed_metric_line(lw, "C100 (%):", metrics, "c100")
+    print_speed_metric_line(lw, "C200 (%):", metrics, "c200")
+    print_speed_metric_line(
+        lw, "Continuity requests:", metrics, "playback_continuity_requests"
+    )
+    print_speed_metric_line(
+        lw,
+        "Continuity N/A (1 chunk):",
+        metrics,
+        "playback_continuity_na_requests",
+    )
     print_speed_metric_line(lw, "Audio chunks mean:", metrics, "audio_chunks_mean")
     print_speed_metric_line(
         lw, "First audio payload bytes:", metrics, "first_audio_payload_bytes_mean"
@@ -352,8 +436,10 @@ def build_speed_results(
 
 def _request_result_to_dict(output: RequestResult) -> dict:
     inter = getattr(output, "inter_chunk_s", None) or None
+    chunk_durs = getattr(output, "chunk_audio_duration_s", None) or None
     ttfp = getattr(output, "audio_ttfp_s", None)
     ttft = getattr(output, "text_ttft_s", None)
+    underrun = getattr(output, "max_playback_underrun_s", None)
     return {
         "id": output.request_id,
         "text": output.text,
@@ -363,6 +449,7 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "rtf": round(output.rtf, 4) if output.rtf < float("inf") else None,
         "prompt_tokens": output.prompt_tokens or None,
         "completion_tokens": output.completion_tokens or None,
+        "finish_reason": output.finish_reason.value,
         "output_token_rate": (
             round(output.tok_per_s, 1) if output.tok_per_s > 0 else None
         ),
@@ -371,6 +458,18 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "audio_ttfp_s": round(ttfp, 4) if ttfp is not None else None,
         "text_ttft_s": round(ttft, 4) if ttft is not None else None,
         "inter_chunk_s": [round(d, 4) for d in inter] if inter else None,
+        "chunk_audio_duration_s": (
+            [round(d, 4) for d in chunk_durs] if chunk_durs else None
+        ),
+        "max_playback_underrun_s": (
+            round(underrun, 4) if underrun is not None else None
+        ),
         "audio_chunk_count": output.audio_chunk_count or None,
         "first_audio_payload_bytes": output.first_audio_payload_bytes or None,
+        "waited_for_slot": output.waited_for_slot,
+        "dispatch_lateness_s": (
+            round(output.dispatch_lateness_s, 4)
+            if output.dispatch_lateness_s is not None
+            else None
+        ),
     }

@@ -6,9 +6,13 @@ Importing this package registers all built-in adapters.
 
 from __future__ import annotations
 
-# Imported for its registration side effect (@register_transcription_adapter).
+# Note (Akazaakane): Import whisper_asr after whisper so the timestamp-capable
+# subclass owns their shared registry key while retaining chunk-context behavior.
 from sglang_omni.serve.transcription_adapters import (  # noqa: F401
+    minicpm_o,
     moss_transcribe_diarize,
+    whisper,
+    whisper_asr,
 )
 from sglang_omni.serve.transcription_adapters.base import (
     TranscriptionAdapter,

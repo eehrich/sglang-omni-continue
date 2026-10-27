@@ -27,6 +27,13 @@
 #     set it here or in CONFIG's generation-stage server arguments. The environment
 #     value takes precedence when both are set.
 #   MF: optional explicit --mem-fraction-static override (unset = pipeline default).
+#   WEIGHT_SHARE (0): 1 = replicas share one copy of the AR backbone weights
+#     over CUDA IPC. Requires CONFIG (the validated-config preflight runs
+#     before any resource is created). Replica 0 is the weight LEADER (loads the checkpoint and
+#     publishes IPC handles under $state/ipc_weights); replicas 1..N-1 attach
+#     zero-copy instead of loading their own copy. The leader owns the shared
+#     storage: if replica 0 dies, followers hold dangling mappings — always
+#     bring the whole run down and restart it together (down + up).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -111,7 +118,7 @@ mps_quit() {
 
 resolve_numa() {
   if [ -n "${NUMA_NODE:-}" ]; then echo "$NUMA_NODE"; return 0; fi
-  # Note (jiaxin): /sys/class/drm ordinals are not guaranteed to match nvidia-smi
+  # Note (Jiaxin Deng): /sys/class/drm ordinals are not guaranteed to match nvidia-smi
   # ordinals, so the NUMA node is derived from the GPU's PCI bus id instead.
   local bus node
   bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$1")
@@ -151,7 +158,7 @@ resolve_state() {
 }
 
 tracked_pids() {
-  # Note (jiaxin): zombies hold no resources and can never be reaped by this
+  # Note (Jiaxin Deng): zombies hold no resources and can never be reaped by this
   # script in init-less containers, so they do not count as live.
   local pgid out="" p
   while IFS=$'\t' read -r _ _ pgid _ _; do
@@ -233,7 +240,7 @@ verify_attach() {
 }
 
 teardown_state() {
-  # Note (jiaxin): these GPUs are shared; teardown only signals processes recorded
+  # Note (Jiaxin Deng): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
   local state=$1 keep=${2:-} leader_pid pgid leader_start t live raw control_pid=""
@@ -248,7 +255,7 @@ teardown_state() {
     [ -z "${live// /}" ] && break
     sleep "$DRAIN_INTERVAL"
   done
-  # Note (jiaxin): the pipe is private to this run, so ANY client the daemon still
+  # Note (Jiaxin Deng): the pipe is private to this run, so ANY client the daemon still
   # reports is outstanding even if its PID left the tracked groups; quitting around
   # live clients can wedge the MPS server with RPC failures that outlast this run.
   if raw=$(mps_clients "$state"); then
@@ -309,6 +316,8 @@ up() {
   local config=${CONFIG:-} model=${MODEL:-bosonai/higgs-tts-3-4b}
   local model_name=${MODEL_NAME:-}
   local gpu=${GPU_ID:-0} n=${N:-3} base_port=${BASE_PORT:-8801} mf=${MF:-}
+  local weight_share=${WEIGHT_SHARE:-0}
+  [[ "$weight_share" =~ ^[01]$ ]] || die "WEIGHT_SHARE must be 0 or 1, got '$weight_share'"
   [[ "$gpu" =~ ^[0-9]+$ ]] || die "GPU_ID must be a non-negative integer, got '$gpu'"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer, got '$n'"
   [[ "$base_port" =~ ^[1-9][0-9]*$ ]] \
@@ -327,6 +336,10 @@ up() {
   local serve_cmd=(sgl-omni serve) source_args=() model_name_args=()
   local extra_args=() mem_args=()
   local expected_max_total_tokens=${MAX_TOTAL_TOKENS:-}
+  local engine_stage=""
+  local kv_cache_bytes=""
+  local mps_budget_manifest=""
+  local uuid=""
   local model_path_manifest=$model
   if [ -n "$config" ]; then
     [ -z "${MODEL:-}" ] || die "MODEL cannot be combined with CONFIG"
@@ -338,6 +351,16 @@ up() {
     if [ -n "$model_name" ]; then
       model_name_args=(--model-name "$model_name")
     fi
+    local kv_probe_args=("$config" --print-kv-cache-bytes)
+    if [ "$weight_share" = 1 ]; then
+      kv_probe_args+=(--weight-share)
+    fi
+    kv_cache_bytes=$("$PYTHON_BIN" "$SCRIPT_DIR/config.py" \
+      "${kv_probe_args[@]}") \
+      || die "could not resolve kv_cache_bytes from $config"
+    if [ -n "$kv_cache_bytes" ] && [ -n "${MAX_TOTAL_TOKENS:-}" ]; then
+      die "MAX_TOTAL_TOKENS conflicts with engine.kv_cache_bytes in $config; a lower token cap would silently shrink the byte-derived KV pool, keep exactly one"
+    fi
     local config_resolver_args=("$config")
     if [ -n "$expected_max_total_tokens" ]; then
       config_resolver_args+=(--max-total-tokens "$expected_max_total_tokens")
@@ -345,23 +368,64 @@ up() {
     if [ "$n" -gt 1 ]; then
       config_resolver_args+=(--require-single-sglang-engine)
     fi
-    expected_max_total_tokens=$("$PYTHON_BIN" "$SCRIPT_DIR/config.py" \
-      "${config_resolver_args[@]}") \
+    if [ "$weight_share" = 1 ]; then
+      config_resolver_args+=(--weight-share)
+    fi
+    local resolved_stage_and_tokens
+    resolved_stage_and_tokens=$("$PYTHON_BIN" "$SCRIPT_DIR/config.py" \
+      --print-stage "${config_resolver_args[@]}") \
       || die "could not resolve max_total_tokens from $config"
+    engine_stage=${resolved_stage_and_tokens%% *}
+    expected_max_total_tokens=${resolved_stage_and_tokens##* }
+    # Note (Aditya Vaid Sharma): nvidia-smi resolves GPU_ID physically, so the
+    # budget helper runs in a single-UUID namespace and queries logical GPU 0.
+    uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$gpu")
+    local budget_args=("$config" --print-mps-memory-budget --gpu-id 0 --replicas "$n")
+    if [ "$weight_share" = 1 ]; then
+      budget_args+=(--weight-share)
+    fi
+    mps_budget_manifest=$(env CUDA_VISIBLE_DEVICES="$uuid" \
+      "$PYTHON_BIN" "$SCRIPT_DIR/config.py" "${budget_args[@]}") \
+      || die "could not resolve MPS memory budget from $config"
   else
+    # Note (Jiaxin Deng): without a pipeline config the supported-model check
+    # cannot run until engine startup, which is after the MPS daemon and state
+    # dir exist; sharing therefore requires CONFIG so unsupported models are
+    # rejected before any resource is created.
+    [ "$weight_share" = 1 ] \
+      && die "WEIGHT_SHARE=1 requires CONFIG (support is checked per pipeline config before any resource is created)"
     source_args=(--model-path "$model")
     model_name=${MODEL_NAME:-higgs}
     model_name_args=(--model-name "$model_name")
+    # Model-path launches default to the Higgs pipeline; its generation
+    # engine stage is tts_engine. Other models need CONFIG, which resolves
+    # the stage name from the pipeline itself.
+    engine_stage=${ENGINE_STAGE:-tts_engine}
   fi
-  if [ "$n" -gt 1 ] && [ -z "$expected_max_total_tokens" ]; then
-    die "MAX_TOTAL_TOKENS is required for N=$n so every replica has the same KV capacity"
+  if [ "$n" -gt 1 ] && [ -z "$expected_max_total_tokens" ] && [ -z "$kv_cache_bytes" ]; then
+    die "MAX_TOTAL_TOKENS is required for N=$n so every replica has the same KV capacity (or declare engine.kv_cache_bytes in CONFIG)"
   fi
   if [ -n "$expected_max_total_tokens" ]; then
     [[ "$expected_max_total_tokens" =~ ^[1-9][0-9]*$ ]] \
       || die "max_total_tokens must be a positive integer, got '$expected_max_total_tokens'"
   fi
   if [ -n "${MAX_TOTAL_TOKENS:-}" ]; then
-    extra_args+=(--max-total-tokens "$expected_max_total_tokens")
+    # The per-stage KV cap is a dotted engine setting on the generation stage.
+    extra_args+=("--${engine_stage}.engine.max_total_tokens" "$expected_max_total_tokens")
+  fi
+  if [ -n "${SERVE_EXTRA_ARGS:-}" ]; then
+    # Note (Jiaxin Deng): the byte-budget preflight resolves CONFIG alone, so a
+    # memory override smuggled in here would be validated by nothing and would
+    # silently replace the budget the MPS sizing was computed from.
+    case " $SERVE_EXTRA_ARGS " in
+      *kv_cache_bytes*|*total_reserve_bytes*|*mem-fraction-static*|*mem_fraction_static*)
+        die "SERVE_EXTRA_ARGS must not set a memory budget (kv_cache_bytes, total_reserve_bytes or mem_fraction_static); the preflight validates CONFIG only, declare it there"
+        ;;
+    esac
+    # Extra sgl-omni serve flags, word-split intentionally (e.g.
+    # "--tts_engine.engine.max_running_requests 32"). Applied identically to every replica.
+    # shellcheck disable=SC2206
+    extra_args+=($SERVE_EXTRA_ARGS)
   fi
   if [ -n "$mf" ]; then
     mem_args+=(--mem-fraction-static "$mf")
@@ -384,10 +448,20 @@ up() {
     fi
   done
 
-  local uuid node run state
-  uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$gpu")
+  local node run state
+  if [ -z "$uuid" ]; then
+    uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$gpu")
+  fi
   node=$(resolve_numa "$gpu")
-  run="run-$(date +%Y%m%d-%H%M%S)-$$"
+  # Note (Jiaxin Deng): a caller (autodp) may pin RUN_ID so it can tear down exactly
+  # the run it started, instead of rediscovering the newest dir.
+  # Note (Yueying Li): RUN_ID becomes a single directory component under
+  # gpu-$gpu; a separator or traversal sequence would relocate run state into
+  # another GPU's namespace (or out of STATE_ROOT) and bypass the
+  # active/stale-run guards above, so restrict it to a run-* basename.
+  run="${RUN_ID:-run-$(date +%Y%m%d-%H%M%S)-$$}"
+  [[ "$run" =~ ^run-[A-Za-z0-9_-]+$ ]] \
+    || die "RUN_ID must be a single 'run-<suffix>' path component ([A-Za-z0-9_-]), got '$run'"
   state=$STATE_ROOT/gpu-$gpu/$run
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
   : > "$state/replicas.tsv"
@@ -405,7 +479,12 @@ up() {
     echo "mem_fraction_static_cli_override=${mf:-none}"
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${expected_max_total_tokens:-auto/profiled}"
+    echo "weight_share=$weight_share"
+    if [ -n "$mps_budget_manifest" ]; then
+      printf '%s\n' "$mps_budget_manifest"
+    fi
   } > "$state/manifest"
+  if [ "$weight_share" = 1 ]; then mkdir -p "$state/ipc_weights"; chmod 700 "$state/ipc_weights"; fi
 
   export CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log
   local mps_launch_status=0
@@ -430,19 +509,33 @@ up() {
   pid_is_live "$control_pid" \
     || die "MPS control daemon PID $control_pid exited during startup"
 
-  local pid leader_start log resolved_tokens
+  local pid leader_start log resolved_tokens ws_env
+  local first_resolved_tokens=""
   for ((i=0; i<n; i++)); do
     port=$((base_port+i))
     log=$state/logs/replica_$i.log
-    # Note (jiaxin): concurrent colocated launches raced on CUDA-graph capture and
+    # Note (Jiaxin Deng): replica 0 leads (loads + exports IPC handles); later
+    # replicas attach. The sequential health gate below already guarantees the
+    # leader has exported (export completes during model load, well before
+    # /health turns 200) by the time any follower boots, so followers never
+    # block on the handle file in this launcher. Empty value = feature off.
+    ws_env=""
+    if [ "$weight_share" = 1 ]; then
+      if [ "$i" = 0 ]; then ws_env="leader:$state/ipc_weights"
+      else ws_env="follower:$state/ipc_weights"; fi
+    fi
+    # Note (Jiaxin Deng): concurrent colocated launches raced on CUDA-graph capture and
     # memory profiling in testing, so replicas start sequentially behind a health
     # gate; setsid gives each replica its own process group so teardown can signal
     # exactly this run's process trees.
     CUDA_VISIBLE_DEVICES="$uuid" \
+    SGLANG_OMNI_WEIGHT_SHARE="$ws_env" \
+    SGLANG_OMNI_WEIGHT_SHARE_RUN_ID="$run" \
+    SGLANG_OMNI_STRICT_PORT=1 \
     setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
       "${serve_cmd[@]}" "${source_args[@]}" "${model_name_args[@]}" \
         "${mem_args[@]}" "${extra_args[@]}" \
-        --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
+        --mps off --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
     pid=$!
     leader_start=$(pid_start_time "$pid") \
       || die "replica $i exited before its process identity could be recorded"
@@ -471,8 +564,19 @@ up() {
     if [ "$n" -gt 1 ]; then
       [ -n "$resolved_tokens" ] \
         || die "replica $i is healthy but its resolved KV capacity is missing from $log"
-      [ "$resolved_tokens" = "$expected_max_total_tokens" ] \
-        || die "replica $i resolved $resolved_tokens KV tokens; expected $expected_max_total_tokens"
+      if [ -n "$expected_max_total_tokens" ]; then
+        [ "$resolved_tokens" = "$expected_max_total_tokens" ] \
+          || die "replica $i resolved $resolved_tokens KV tokens; expected $expected_max_total_tokens"
+      else
+        # Byte-budget mode: every replica must derive the same capacity from
+        # the shared kv_cache_bytes declaration.
+        if [ -z "$first_resolved_tokens" ]; then
+          first_resolved_tokens=$resolved_tokens
+        else
+          [ "$resolved_tokens" = "$first_resolved_tokens" ] \
+            || die "replica $i resolved $resolved_tokens KV tokens; replica 0 resolved $first_resolved_tokens"
+        fi
+      fi
     fi
     echo "replica $i KV #tokens: ${resolved_tokens:-not found}"
   done
@@ -483,7 +587,10 @@ up() {
     exit 1
   fi
   trap - EXIT
-  echo "up: $n replicas on GPU $gpu; token cap ${expected_max_total_tokens:-auto/profiled}; state: $state"
+  echo "up: $n replicas on GPU $gpu; token cap ${expected_max_total_tokens:-auto/profiled}; weight_share=$weight_share; state: $state"
+  if [ "$weight_share" = 1 ]; then
+    echo "weight sharing is ON: replica 0 owns the shared weights — never restart replicas individually; use down + up"
+  fi
   echo "tear down with: bash $0 down $run"
 }
 

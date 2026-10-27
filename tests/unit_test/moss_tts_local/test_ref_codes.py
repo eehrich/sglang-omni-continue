@@ -8,66 +8,70 @@ import base64
 import pytest
 import torch
 
-from sglang_omni.utils.ref_codes import (
-    MAX_REFERENCE_CODE_FRAMES,
-    decode_reference_codes,
-    encode_reference_codes,
+from sglang_omni.models.moss_tts.reference_encoder import (
+    build_reference_encode_admin_handler,
 )
 from sglang_omni.models.moss_tts_local.request_builders import (
+    MossTTSLocalPreparedRequest,
     clear_moss_tts_local_preprocessing_context,
-    pop_prepared_moss_tts_local_request,
     preprocess_moss_tts_local_payload,
-    resolve_moss_tts_local_ref_codes,
+    resolve_moss_ref_codes,
     set_moss_tts_local_preprocessing_context,
 )
 from sglang_omni.pipeline.control_plane import serialize_message
 from sglang_omni.proto import (
     ADMIN_MOSS_ENCODE_REFERENCE,
+    AdminResult,
+    AdminResultMessage,
     OmniRequest,
     StagePayload,
+)
+from sglang_omni.utils.ref_codes import (
+    MAX_REFERENCE_CODE_FRAMES,
+    decode_reference_codes,
+    encode_reference_codes,
 )
 
 N_VQ = 12
 AUDIO_VOCAB_SIZE = 1024
+PREPARED_MARKER = "_moss_tts_local_prepared_request"
 
 
-def _codes(frames: int = 7) -> torch.Tensor:
+def make_codes(frames: int = 7) -> torch.Tensor:
     return (torch.arange(frames * N_VQ, dtype=torch.long) % AUDIO_VOCAB_SIZE).reshape(
         frames, N_VQ
     )
 
 
-def _decode(raw):
-    return decode_reference_codes(
-        raw, n_vq=N_VQ, audio_vocab_size=AUDIO_VOCAB_SIZE
-    )
+def decode(raw):
+    return decode_reference_codes(raw, n_vq=N_VQ, audio_vocab_size=AUDIO_VOCAB_SIZE)
 
 
 def test_packed_round_trip_is_lossless():
-    codes = _codes()
+    codes = make_codes()
     packed = encode_reference_codes(codes)
     assert packed["shape"] == [7, N_VQ]
     assert packed["dtype"] == "int16"
-    decoded = _decode(packed)
+    decoded = decode(packed)
     assert decoded.dtype == torch.long
     assert torch.equal(decoded, codes)
 
 
 def test_nested_list_form_is_accepted():
-    codes = _codes(3)
-    assert torch.equal(_decode(codes.tolist()), codes)
+    codes = make_codes(3)
+    assert torch.equal(decode(codes.tolist()), codes)
 
 
 def test_tensor_passthrough_is_validated_and_cast():
-    codes = _codes(3).to(torch.int16)
-    decoded = _decode(codes)
+    codes = make_codes(3).to(torch.int16)
+    decoded = decode(codes)
     assert decoded.dtype == torch.long
     assert torch.equal(decoded, codes.long())
 
 
 @pytest.mark.parametrize("dtype", ["int16", "uint16", "int32", "uint32"])
 def test_supported_dtypes(dtype):
-    codes = _codes(4)
+    codes = make_codes(4)
     torch_dtype = torch.int16 if dtype.endswith("16") else torch.int32
     raw = codes.to(torch_dtype).contiguous().numpy().tobytes()
     packed = {
@@ -75,88 +79,95 @@ def test_supported_dtypes(dtype):
         "shape": [4, N_VQ],
         "dtype": dtype,
     }
-    assert torch.equal(_decode(packed), codes)
+    assert torch.equal(decode(packed), codes)
 
 
 def test_wrong_n_vq_is_rejected():
     with pytest.raises(ValueError, match=f"expected shape \\[T, {N_VQ}\\]"):
-        _decode(encode_reference_codes(torch.zeros((5, N_VQ - 1), dtype=torch.long)))
+        decode(encode_reference_codes(torch.zeros((5, N_VQ - 1), dtype=torch.long)))
 
 
 def test_transposed_payload_is_rejected():
     # [n_vq, T] is the codec's own pre-transpose layout and the most likely
     # producer mistake; it must fail loudly rather than clone a garbage voice.
     with pytest.raises(ValueError, match="expected shape"):
-        _decode(encode_reference_codes(_codes(40).transpose(0, 1).contiguous()))
+        decode(encode_reference_codes(make_codes(40).transpose(0, 1).contiguous()))
 
 
 def test_byte_length_mismatch_is_rejected():
-    packed = encode_reference_codes(_codes(6))
+    packed = encode_reference_codes(make_codes(6))
     packed["shape"] = [5, N_VQ]
     with pytest.raises(ValueError, match="needs"):
-        _decode(packed)
+        decode(packed)
 
 
 def test_out_of_range_code_is_rejected():
-    codes = _codes(3)
+    codes = make_codes(3)
     codes[1, 2] = AUDIO_VOCAB_SIZE  # the pad code, never valid in a reference
     with pytest.raises(ValueError, match="codes must lie in"):
-        _decode(codes)
+        decode(codes)
 
 
 def test_reference_length_cap():
     too_long = torch.zeros((MAX_REFERENCE_CODE_FRAMES + 1, N_VQ), dtype=torch.long)
     with pytest.raises(ValueError, match="limit is"):
-        _decode(too_long)
+        decode(too_long)
 
 
 def test_bad_base64_is_rejected():
     with pytest.raises(ValueError, match="not valid base64"):
-        _decode({"data": "not base64!!", "shape": [1, N_VQ]})
+        decode({"data": "not base64!!", "shape": [1, N_VQ]})
 
 
 def test_unsupported_type_is_rejected():
     with pytest.raises(ValueError, match="must be a packed"):
-        _decode(42)
+        decode(42)
 
 
-class _RecordingProcessor:
-    """Captures the reference the request builder hands to the processor."""
+class RecordingProcessor:
+    """Captures what the request builder hands to the processor."""
 
     model_config = type(
-        "_FakeModelConfig",
+        "FakeModelConfig",
         (),
         {"n_vq": N_VQ, "audio_vocab_size": AUDIO_VOCAB_SIZE},
     )()
 
     def __init__(self) -> None:
         self.reference = "unset"
+        self.conversations = None
+        self.mode = None
 
     def build_user_message(self, **kwargs):
         self.reference = kwargs.get("reference")
         return dict(kwargs, role="user")
 
+    def build_assistant_message(self, audio_codes_list):
+        return {"role": "assistant", "audio_codes_list": audio_codes_list}
+
     def __call__(self, conversations, mode):
+        self.conversations = conversations
+        self.mode = mode
         rows = torch.full((1, 4, N_VQ + 1), AUDIO_VOCAB_SIZE, dtype=torch.long)
         rows[0, :, 0] = torch.arange(4)
         return {"input_ids": rows}
 
 
-class _ExplodingEncoder:
-    """Any call means a codec encode was about to run -- the thing we removed."""
+class ExplodingEncoder:
+    """Any call means a codec encode was about to run -- the thing codes remove."""
 
-    def encode(self, path):  # pragma: no cover - must not be reached
+    def encode(self, source):  # pragma: no cover - must not be reached
         raise AssertionError("reference encoder must not run when ref_codes is given")
 
-    def encode_data_uri(self, ref_audio):  # pragma: no cover - must not be reached
-        raise AssertionError("reference encoder must not run when ref_codes is given")
+    def close(self) -> None:
+        pass
 
 
-def _payload(tts_params: dict) -> StagePayload:
+def make_payload(tts_params: dict, inputs: dict | None = None) -> StagePayload:
     return StagePayload(
         request_id="req-codes",
         request=OmniRequest(
-            inputs={"text": "hallo welt"},
+            inputs=inputs or {"text": "hallo welt"},
             params={},
             metadata={"task": "tts", "tts_params": tts_params},
         ),
@@ -164,115 +175,125 @@ def _payload(tts_params: dict) -> StagePayload:
     )
 
 
+def run_preprocess(processor, tts_params: dict) -> MossTTSLocalPreparedRequest:
+    set_moss_tts_local_preprocessing_context(
+        processor=processor, reference_encoder=ExplodingEncoder()
+    )
+    try:
+        payload = preprocess_moss_tts_local_payload(make_payload(tts_params))
+    finally:
+        clear_moss_tts_local_preprocessing_context()
+    return MossTTSLocalPreparedRequest(**payload.data[PREPARED_MARKER])
+
+
 def test_ref_codes_resolve_from_tts_params():
-    codes = _codes(3)
-    resolved = resolve_moss_tts_local_ref_codes(
-        _payload({"ref_codes": encode_reference_codes(codes)}),
-        processor=_RecordingProcessor(),
+    codes = make_codes(3)
+    resolved = resolve_moss_ref_codes(
+        make_payload({"ref_codes": encode_reference_codes(codes)}),
+        processor=RecordingProcessor(),
     )
     assert torch.equal(resolved, codes)
 
 
 def test_ref_codes_resolve_from_reference_descriptor():
-    codes = _codes(3)
-    payload = StagePayload(
-        request_id="req-codes",
-        request=OmniRequest(
-            inputs={
-                "text": "hallo",
-                "references": [{"ref_codes": encode_reference_codes(codes)}],
-            },
-            params={},
-            metadata={"task": "tts", "tts_params": {}},
-        ),
-        data={},
+    codes = make_codes(3)
+    payload = make_payload(
+        {},
+        inputs={
+            "text": "hallo",
+            "references": [{"ref_codes": encode_reference_codes(codes)}],
+        },
     )
-    resolved = resolve_moss_tts_local_ref_codes(
-        payload, processor=_RecordingProcessor()
+    assert torch.equal(
+        resolve_moss_ref_codes(payload, processor=RecordingProcessor()), codes
     )
-    assert torch.equal(resolved, codes)
 
 
 def test_absent_ref_codes_resolve_to_none():
     assert (
-        resolve_moss_tts_local_ref_codes(
-            _payload({"ref_audio": "/tmp/x.wav"}), processor=_RecordingProcessor()
+        resolve_moss_ref_codes(
+            make_payload({"ref_audio": "/tmp/x.wav"}), processor=RecordingProcessor()
         )
         is None
     )
 
 
 def test_prepared_state_stays_msgpack_serializable():
-    """The terminal stage hop msgpacks the state dict; a tensor there is fatal.
-
-    A code tensor parked on MossTTSLocalState killed the vocoder process with
-    "can not serialize 'Tensor' object", so the codes must never reach the
-    wire form of the state.
-    """
-    processor = _RecordingProcessor()
-    set_moss_tts_local_preprocessing_context(
-        processor=processor, reference_encoder=_ExplodingEncoder()
+    """The terminal stage hop msgpacks the state dict; a tensor there is fatal."""
+    prepared = run_preprocess(
+        RecordingProcessor(), {"ref_codes": encode_reference_codes(make_codes(5))}
     )
-    try:
-        payload = preprocess_moss_tts_local_payload(
-            _payload({"ref_codes": encode_reference_codes(_codes(5))})
-        )
-        prepared = pop_prepared_moss_tts_local_request(payload)
-    finally:
-        clear_moss_tts_local_preprocessing_context()
-    assert prepared is not None
     wire = prepared.state.to_dict()
     assert not any(isinstance(value, torch.Tensor) for value in wire.values())
-    serialize_message(_FakeCompleteMessage(wire))
+    serialize_message(FakeCompleteMessage(wire))
 
 
-class _FakeCompleteMessage:
+class FakeCompleteMessage:
     """Minimal stand-in for the control-plane message that carries state data."""
 
     def __init__(self, data: dict) -> None:
-        self._data = data
+        self.data = data
 
     def to_dict(self) -> dict:
-        return {"kind": "complete", "request_id": "req-codes", "data": self._data}
+        return {"kind": "complete", "request_id": "req-codes", "data": self.data}
 
 
 def test_preprocess_routes_codes_and_skips_the_encoder():
-    codes = _codes(9)
-    processor = _RecordingProcessor()
-    set_moss_tts_local_preprocessing_context(
-        processor=processor, reference_encoder=_ExplodingEncoder()
+    codes = make_codes(9)
+    processor = RecordingProcessor()
+    prepared = run_preprocess(
+        processor,
+        {
+            # ref_audio present too: codes must win, no encode.
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_codes": encode_reference_codes(codes),
+        },
     )
-    try:
-        payload = preprocess_moss_tts_local_payload(
-            _payload(
-                {
-                    # ref_audio present too: codes must win, no encode.
-                    "ref_audio": "data:audio/wav;base64,AAAA",
-                    "ref_codes": encode_reference_codes(codes),
-                }
-            )
-        )
-        prepared = pop_prepared_moss_tts_local_request(payload)
-        assert prepared is not None
-    finally:
-        clear_moss_tts_local_preprocessing_context()
-
+    assert processor.mode == "generation"
     assert isinstance(processor.reference, list) and len(processor.reference) == 1
     assert torch.equal(processor.reference[0], codes)
+    assert prepared.prefix_codes is None
 
 
 def test_preprocess_rejects_malformed_codes():
-    processor = _RecordingProcessor()
-    set_moss_tts_local_preprocessing_context(
-        processor=processor, reference_encoder=_ExplodingEncoder()
+    with pytest.raises(ValueError, match="expected shape"):
+        run_preprocess(RecordingProcessor(), {"ref_codes": [[1, 2, 3]]})
+
+
+def test_continuation_puts_prior_codes_in_the_assistant_slot():
+    """Continuation resumes the model's own stream: prior codes are the
+    assistant turn, the user turn carries no reference, and the same rows
+    travel on as the vocoder's decoder context."""
+    codes = make_codes(6)
+    processor = RecordingProcessor()
+    prepared = run_preprocess(
+        processor,
+        {"continuation": True, "ref_codes": encode_reference_codes(codes)},
     )
-    try:
-        with pytest.raises(ValueError, match="expected shape"):
-            preprocess_moss_tts_local_payload(
-                _payload({"ref_codes": [[1, 2, 3]]}),
-            )
-    finally:
-        clear_moss_tts_local_preprocessing_context()
+    assert processor.mode == "continuation"
+    (conversation,) = processor.conversations
+    user, assistant = conversation
+    assert user["role"] == "user" and user["reference"] is None
+    assert assistant["role"] == "assistant"
+    assert torch.equal(assistant["audio_codes_list"][0], codes)
+    assert torch.equal(prepared.prefix_codes, codes)
+
+
+def test_continuation_voice_ref_codes_go_to_the_user_slot():
+    prefix = make_codes(6)
+    voice = make_codes(3) + 1
+    processor = RecordingProcessor()
+    run_preprocess(
+        processor,
+        {
+            "continuation": True,
+            "ref_codes": encode_reference_codes(prefix),
+            "voice_ref_codes": encode_reference_codes(voice),
+        },
+    )
+    user, assistant = processor.conversations[0]
+    assert torch.equal(user["reference"][0], voice)
+    assert torch.equal(assistant["audio_codes_list"][0], prefix)
 
 
 # ----------------------------------------------------------------------
@@ -280,30 +301,26 @@ def test_preprocess_rejects_malformed_codes():
 # ----------------------------------------------------------------------
 
 
-class _FakeReferenceEncoder:
-    """Stands in for the preprocessing stage's batched codec encoder."""
+class FakeReferenceEncoder:
+    """Stands in for the preprocessing stage's shared reference encoder."""
 
     def __init__(self) -> None:
         self.seen: list[str] = []
 
-    def encode_data_uri(self, ref_audio: str) -> torch.Tensor:
-        self.seen.append(ref_audio)
-        if "boom" in ref_audio:
-            raise ValueError("not a data URI")
-        return _codes(3)
+    def encode(self, source: str) -> torch.Tensor:
+        self.seen.append(source)
+        if "boom" in source:
+            raise ValueError("decode failed")
+        return make_codes(3)
 
 
-def _handler(encoder):
-    from sglang_omni.models.moss_tts_local.stages import (
-        build_reference_encode_admin_handler,
-    )
-
+def make_handler(encoder):
     return build_reference_encode_admin_handler(encoder, n_vq=N_VQ)
 
 
 def test_admin_encode_returns_wire_form_codes():
-    encoder = _FakeReferenceEncoder()
-    out = _handler(encoder)(
+    encoder = FakeReferenceEncoder()
+    out = make_handler(encoder)(
         ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "data:audio/flac;base64,AAAA"}
     )
     assert out["success"] is True
@@ -311,14 +328,14 @@ def test_admin_encode_returns_wire_form_codes():
     assert out["frames_per_second"] == 12.5
     assert len(out["codes"]) == 1
     # Round-trips through the very validator the generate path applies.
-    assert torch.equal(_decode(out["codes"][0]), _codes(3))
+    assert torch.equal(decode(out["codes"][0]), make_codes(3))
     assert encoder.seen == ["data:audio/flac;base64,AAAA"]
 
 
 def test_admin_encode_preserves_request_order_for_batches():
-    encoder = _FakeReferenceEncoder()
+    encoder = FakeReferenceEncoder()
     items = [f"data:audio/flac;base64,{i}" for i in range(5)]
-    out = _handler(encoder)(ADMIN_MOSS_ENCODE_REFERENCE, {"audio": items})
+    out = make_handler(encoder)(ADMIN_MOSS_ENCODE_REFERENCE, {"audio": items})
     assert out["success"] is True
     assert len(out["codes"]) == 5
     assert sorted(encoder.seen) == sorted(items)
@@ -326,11 +343,9 @@ def test_admin_encode_preserves_request_order_for_batches():
 
 def test_admin_encode_result_is_msgpack_serializable():
     """The codes cross a ZMQ control-plane hop; a tensor there would kill it."""
-    out = _handler(_FakeReferenceEncoder())(
+    out = make_handler(FakeReferenceEncoder())(
         ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "data:audio/wav;base64,AAAA"}
     )
-    from sglang_omni.proto import AdminResult, AdminResultMessage
-
     serialize_message(
         AdminResultMessage(
             AdminResult(
@@ -344,25 +359,30 @@ def test_admin_encode_result_is_msgpack_serializable():
     )
 
 
-@pytest.mark.parametrize("bad", [None, [], "", ["ok", 3]])
-def test_admin_encode_rejects_malformed_audio_field(bad):
-    out = _handler(_FakeReferenceEncoder())(
-        ADMIN_MOSS_ENCODE_REFERENCE, {"audio": bad}
-    )
+@pytest.mark.parametrize(
+    "bad",
+    [None, [], "", ["data:audio/wav;base64,AAAA", 3], "/etc/passwd", "http://x/a.wav"],
+)
+def test_admin_encode_rejects_anything_but_data_uris(bad):
+    """The route is unauthenticated: no local paths, no fetching URLs."""
+    encoder = FakeReferenceEncoder()
+    out = make_handler(encoder)(ADMIN_MOSS_ENCODE_REFERENCE, {"audio": bad})
     assert out["success"] is False
     assert "audio" in out["error"]
+    assert encoder.seen == []
 
 
-def test_admin_encode_propagates_encoder_failure():
-    with pytest.raises(ValueError, match="not a data URI"):
-        _handler(_FakeReferenceEncoder())(
-            ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "boom"}
-        )
+def test_admin_encode_reports_encoder_failure():
+    out = make_handler(FakeReferenceEncoder())(
+        ADMIN_MOSS_ENCODE_REFERENCE, {"audio": "data:audio/wav;base64,boom"}
+    )
+    assert out["success"] is False
+    assert "decode failed" in out["error"]
 
 
 def test_admin_handler_opts_out_of_foreign_actions():
     """model_info/weight updates fan out to ALL stages; keep opting out."""
-    out = _handler(_FakeReferenceEncoder())("model_info", {})
+    out = make_handler(FakeReferenceEncoder())("model_info", {})
     assert out["success"] is True
     assert out["unsupported"] is True and out["skipped"] is True
 

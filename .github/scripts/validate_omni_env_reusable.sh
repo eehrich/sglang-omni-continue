@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Strict gate for reusing an existing OMNI_CI_HOME venv across workflow runs.
 #
-# Checks path safety, pyproject.toml fingerprint (when recorded), import probe,
+# Checks path safety, dependency fingerprint (when recorded), import probe,
 # and exact == pins. Missing .deps-hash is allowed when the venv itself matches
 # pyproject.toml (e.g. prior setup installed packages but failed a post-install gate).
 # Does not require .omni-env-complete (downstream jobs use this gate; setup writes marker).
 set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/pin_to_ci_cpuset.sh"
 
 if [ "$#" -ne 1 ]; then
   echo "usage: $0 <venv-name>" >&2
@@ -27,11 +29,47 @@ source "${SCRIPT_DIR}/omni_ci_deps_hash.sh"
 DEPS_HASH="$(omni_ci_deps_hash)"
 DEPS_HASH_FILE="${OMNI_CI_HOME}/.deps-hash"
 
+PYTHON="${OMNI_CI_HOME}/${VENV_NAME}/bin/python"
+if [ ! -x "${PYTHON}" ]; then
+  echo "python not found: ${PYTHON}" >&2
+  exit 1
+fi
+
+if ! "${PYTHON}" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 12))'; then
+  echo "OMNI CI venv must use the image Python 3.12 ABI" >&2
+  exit 1
+fi
+
+if ! grep -Eq '^include-system-site-packages = true$' "${OMNI_CI_HOME}/${VENV_NAME}/pyvenv.cfg"; then
+  echo "OMNI CI venv must inherit the image site-packages" >&2
+  exit 1
+fi
+
+if ! "${PYTHON}" - <<'PY'
+from pathlib import Path
+import sys
+import flashinfer
+import torch
+
+venv = Path(sys.prefix).resolve()
+for module in (flashinfer, torch):
+    if Path(module.__file__).resolve().is_relative_to(venv):
+        raise SystemExit(f"{module.__name__} must come from the image, not {venv}")
+PY
+then
+  echo "Torch and FlashInfer must use the image installation for JIT cache reuse" >&2
+  exit 1
+fi
+
+if ! "${PYTHON}" "${SCRIPT_DIR}/omni_missing_dependencies.py" --check --extra minicpm-o --extra fun-cosyvoice3 pyproject.toml; then
+  exit 1
+fi
+
 if [ -f "${DEPS_HASH_FILE}" ]; then
   STORED_HASH="$(tr -d '[:space:]' < "${DEPS_HASH_FILE}")"
   if [ "${STORED_HASH}" != "${DEPS_HASH}" ]; then
     echo "deps-hash mismatch: stored=${STORED_HASH} current=${DEPS_HASH}" >&2
-    echo "pyproject.toml changed; full environment rebuild required" >&2
+    echo "CI dependencies or preparation script changed; full environment rebuild required" >&2
     exit 1
   fi
 else

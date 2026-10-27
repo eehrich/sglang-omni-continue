@@ -76,6 +76,11 @@ def add_server_args(
         default=model_name,
         help="Model name exposed by /v1/models.",
     )
+    target.add_argument(
+        "--skip-server-warmup",
+        action="store_true",
+        help="Report ready without sending the pipeline's warmup requests first.",
+    )
 
 
 def add_offline_args(
@@ -124,17 +129,27 @@ def apply_stage_factory_updates(
     updates: dict[str, object] | None = None,
     server_arg_updates: dict[str, object] | None = None,
 ) -> None:
+    """Fold launcher flag values into one stage's consumer groups.
+
+    ``updates`` are constructor kwargs and merge into the stage's ``factory``
+    group; ``server_arg_updates`` merge into its ``engine`` block.
+    """
+    from sglang_omni.config.schema import EngineArgs
+
     for stage in config.stages:
         if stage.name != stage_name:
             continue
-        factory_args = dict(stage.factory_args or {})
         if updates:
-            factory_args.update(updates)
+            group = stage.factory
+            stage.factory = type(group)(
+                **{**group.model_dump(exclude_none=True), **updates}
+            )
         if server_arg_updates:
-            overrides = dict(factory_args.get("server_args_overrides") or {})
-            overrides.update(server_arg_updates)
-            factory_args["server_args_overrides"] = overrides
-        stage.factory_args = factory_args
+            engine = stage.engine
+            data = dict(engine.overrides()) if engine is not None else {}
+            data.update(server_arg_updates)
+            engine_cls = type(engine) if engine is not None else EngineArgs
+            stage.engine = engine_cls(**data)
         return
     raise ValueError(
         f"Stage {stage_name!r} not found in config {type(config).__name__}"
@@ -159,9 +174,6 @@ def set_stage_tp_size(config: Any, stage_name: str, tp_size: int) -> None:
     for stage in config.stages:
         if stage.name == stage_name:
             stage.tp_size = int(tp_size)
-            stage.parallelism = stage.parallelism.model_copy(
-                update={"tp": int(tp_size)}
-            )
             return
     raise ValueError(
         f"Stage {stage_name!r} not found in config {type(config).__name__}"

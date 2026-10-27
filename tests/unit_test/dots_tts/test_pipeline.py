@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Any
+
+import pytest
+
+from sglang_omni.config.resolver import ConfigResolver
+from sglang_omni.config.runtime import resolve_stage_typed_kwargs
+from sglang_omni.config.sources import patches_from_shared_block
+from sglang_omni.serve.speech_errors import SpeechAPIError
+from sglang_omni.serve.speech_service import SpeechRequestValidator
+
+
+def test_dots_tts_shares_acoustic_limits_via_shared() -> None:
+    """One shared entry feeds the solver settings to both consumers."""
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    config = DotsTTSPipelineConfig(model_path="model")
+    patches = patches_from_shared_block(
+        [
+            {
+                "select": {"stages": ["preprocessing", "latent_engine"]},
+                "factory": {"num_steps": 8, "max_generate_length": 256},
+            }
+        ],
+        DotsTTSPipelineConfig,
+        [stage.name for stage in config.stages],
+    )
+    resolved = ConfigResolver(config).resolve(patches).config
+
+    for name in ("preprocessing", "latent_engine"):
+        kwargs = resolve_stage_typed_kwargs(resolved.stage_named(name))
+        assert kwargs["num_steps"] == 8
+        assert kwargs["max_generate_length"] == 256
+
+
+def test_public_speech_boundary_accepts_dots_auto_detect_alias() -> None:
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    config = DotsTTSPipelineConfig(model_path="dots-studio/dots.tts-mf")
+    validator = SpeechRequestValidator(
+        default_model=config.model_path,
+        required_speech_reference_count=config.required_speech_reference_count,
+        speech_reference_text_required=config.speech_reference_text_required,
+        additional_speech_languages=config.additional_speech_languages,
+    )
+
+    request = validator.parse_generation_request(
+        {
+            "input": "hello",
+            "language": "AUTO_DETECT",
+            "ref_audio": "data:audio/wav;base64,UklGRg==",
+            "ref_text": "reference",
+        }
+    )
+
+    assert request.request.language == "auto_detect"
+
+
+@pytest.mark.parametrize(
+    ("payload", "param"),
+    [
+        ({"input": "target"}, "ref_audio"),
+        (
+            {
+                "input": "target",
+                "ref_audio": "data:audio/wav;base64,UklGRg==",
+            },
+            "ref_text",
+        ),
+        (
+            {
+                "input": "target",
+                "ref_audio": "data:audio/wav;base64,UklGRg==",
+                "ref_text": "reference",
+                "references": [
+                    {
+                        "data": "UklGRg==",
+                        "media_type": "audio/wav",
+                        "text": "reference",
+                    }
+                ],
+            },
+            "references",
+        ),
+    ],
+)
+def test_public_speech_boundary_enforces_dots_conditioning_contract(
+    payload: dict[str, Any], param: str
+) -> None:
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    config = DotsTTSPipelineConfig(model_path="dots-studio/dots.tts-mf")
+    validator = SpeechRequestValidator(
+        default_model=config.model_path,
+        required_speech_reference_count=config.required_speech_reference_count,
+        speech_reference_text_required=config.speech_reference_text_required,
+    )
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        validator.parse_generation_request(payload)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == param
+
+
+def test_dots_tts_rejects_tp() -> None:
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    raw = DotsTTSPipelineConfig(model_path="model").model_dump()
+    stage = next(item for item in raw["stages"] if item["name"] == "latent_engine")
+    stage["tp_size"] = 2
+    stage["gpu"] = [0, 1]
+    stage["process"] = "latent_engine"
+    with pytest.raises(ValueError, match="tp_size=1"):
+        DotsTTSPipelineConfig(**raw)

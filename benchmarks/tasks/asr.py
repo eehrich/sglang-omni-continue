@@ -3,7 +3,7 @@
 
 Owns the ASR/WER primitives shared by the standalone ASR benchmark
 (benchmarks/eval/benchmark_asr_seedtts.py), the ASR CI gate
-(tests/test_model/test_asr_ci_fun_asr.py), the TTS WER stage
+(tests/test_model/test_asr_ci_seedtts.py), the TTS WER stage
 (benchmarks.tasks.tts.run_seedtts_transcribe), and the talker WER paths.
 """
 
@@ -13,6 +13,7 @@ import asyncio
 import concurrent.futures
 import functools
 import io
+import json
 import logging
 import os
 import string
@@ -22,6 +23,7 @@ import wave
 import aiohttp
 import requests
 import torch
+import torchaudio
 from jiwer import process_words
 
 from benchmarks.benchmarker.data import RequestResult
@@ -34,6 +36,7 @@ from benchmarks.metrics.wer import (
     calculate_asr_speed_metrics,
     calculate_wer_metrics,
 )
+from sglang_omni.utils.audio import load_with_torchaudio
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +97,7 @@ def normalize_text(text: str, lang: str) -> str:
 
 
 def _load_wav_mono_16k(wav_path: str) -> torch.Tensor:
-    import torchaudio
-
-    audio, sample_rate = torchaudio.load(wav_path)
+    audio, sample_rate = load_with_torchaudio(wav_path, source_name="ASR benchmark")
     if audio.ndim == 2 and audio.shape[0] > 1:
         audio = audio.mean(dim=0, keepdim=True)
     audio = audio.squeeze(0).to(torch.float32)
@@ -219,8 +220,8 @@ def load_router_asr(
 def _transcribe_qwen3_asr(asr: dict, wav_path: str, lang: str) -> str:
     """Transcribe one wav via the Qwen3-ASR server's /v1/audio/transcriptions.
 
-    Note: do not send temperature=0 because Qwen3-ASR degenerates under pure
-    greedy (the server bumps it to 0.01). The language field selects the
+    note (Xinyu): Qwen3-ASR uses its greedy server default unless the caller
+    sends an explicit sampling temperature. The language field selects the
     forced prefix. max_new_tokens comes from the Qwen3 ASR pipeline config.
     """
     with open(wav_path, "rb") as audio_file:
@@ -318,12 +319,14 @@ def make_asr_send_fn(
     model_name: str,
     api_url: str,
     lang: str = "en",
+    *,
+    stream: bool = False,
 ) -> SendFn:
     """Return a send_fn(session, sample) -> RequestResult that transcribes one
     SeedTTS reference clip via the Omni /v1/audio/transcriptions endpoint.
 
-    Note: do not send temperature=0 because Qwen3-ASR degenerates under pure
-    greedy (the server bumps it to 0.01). The language field selects the
+    note (Xinyu): Qwen3-ASR uses its greedy server default unless the caller
+    sends an explicit sampling temperature. The language field selects the
     forced prefix. max_new_tokens comes from the Qwen3 ASR pipeline config.
     """
 
@@ -343,6 +346,8 @@ def make_asr_send_fn(
         form.add_field("model", model_name)
         form.add_field("language", "en" if lang == "en" else lang)
         form.add_field("response_format", "json")
+        if stream:
+            form.add_field("stream", "true")
         form.add_field(
             "file",
             audio_bytes,
@@ -350,16 +355,27 @@ def make_asr_send_fn(
             content_type="audio/wav",
         )
 
+        headers = {"x-sglang-omni-route-stream": "true"} if stream else None
         start_time = time.perf_counter()
         try:
-            async with session.post(api_url, data=form) as response:
+            async with session.post(api_url, data=form, headers=headers) as response:
                 if response.status != 200:
                     result.error = f"HTTP {response.status}: {await response.text()}"
+                elif stream:
+                    result.text = await _consume_transcription_stream(
+                        response, result, start_time
+                    )
+                    result.is_success = True
                 else:
                     payload = await response.json()
                     result.text = str(payload.get("text", ""))
                     result.is_success = True
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
             result.error = str(exc)
         finally:
             result.latency_s = time.perf_counter() - start_time
@@ -368,6 +384,42 @@ def make_asr_send_fn(
         return result
 
     return send_fn
+
+
+async def _consume_transcription_stream(
+    response: aiohttp.ClientResponse,
+    result: RequestResult,
+    start_time: float,
+) -> str:
+    final_text: str | None = None
+    last_delta_t: float | None = None
+    seen_done = False
+    async for raw_line in response.content:
+        line = raw_line.decode("utf-8").strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload == "[DONE]":
+            seen_done = True
+            continue
+        event = json.loads(payload)
+        event_type = event.get("type")
+        if event_type == "transcript.text.delta":
+            now = time.perf_counter()
+            if result.text_ttft_s is None:
+                result.text_ttft_s = now - start_time
+            elif last_delta_t is not None:
+                result.inter_chunk_s.append(now - last_delta_t)
+            last_delta_t = now
+        elif event_type == "transcript.text.done":
+            final_text = event.get("text")
+        elif event_type == "error":
+            raise ValueError("Stream error event: {}".format(event.get("error")))
+    if not isinstance(final_text, str):
+        raise ValueError("Stream ended without a transcript.text.done event")
+    if not seen_done:
+        raise ValueError("Stream ended without a [DONE] event")
+    return final_text.strip()
 
 
 async def run_asr_transcription(
@@ -381,13 +433,14 @@ async def run_asr_transcription(
     warmup: int = 0,
     request_timeout_s: int = QWEN3_ASR_REQUEST_TIMEOUT_S,
     disable_tqdm: bool = True,
+    stream: bool = False,
 ) -> tuple[list[RequestResult], float]:
     """Transcribe samples against a running ASR router at one concurrency.
 
     Returns (outputs, wall_clock_s) via the shared BenchmarkRunner.
     """
     api_url = f"http://{host}:{port}/v1/audio/transcriptions"
-    send_fn = make_asr_send_fn(model_path, api_url, lang=lang)
+    send_fn = make_asr_send_fn(model_path, api_url, lang=lang, stream=stream)
     runner = BenchmarkRunner(
         RunConfig(
             max_concurrency=concurrency,
@@ -443,6 +496,8 @@ def build_asr_eval_results(
                 "hyp_norm": output.hyp_norm,
                 "audio_duration_s": output.audio_duration_s,
                 "latency_s": output.latency_s,
+                "text_ttft_s": result.text_ttft_s if result else None,
+                "inter_chunk_s": result.inter_chunk_s if result else [],
                 "error": output.error,
             }
         )
@@ -459,6 +514,7 @@ def build_asr_eval_results(
         "asr_model": model_path,
         "asr_concurrency": concurrency,
         "asr_rtf_p95": perf.get("rtf_p95"),
+        "rtfx": perf.get("audio_throughput_s_per_s", 0.0),
         # note (Yue Yin): plain calibration keys read by tune-ci-thresholds + gate
         "throughput_samples_per_s": asr_speed["asr_throughput_samples_per_s"],
         "latency_mean_s": asr_speed["asr_latency_mean_s"],
@@ -469,6 +525,17 @@ def build_asr_eval_results(
         "rtf_median": asr_speed["asr_rtf_median"],
         "rtf_p95": perf.get("rtf_p95"),
     }
+    for key in (
+        "text_ttft_mean_s",
+        "text_ttft_median_s",
+        "text_ttft_p95_s",
+        "text_ttft_p99_s",
+        "inter_chunk_mean_s",
+        "inter_chunk_p95_s",
+        "inter_chunk_p99_s",
+    ):
+        if key in perf:
+            speed[key] = perf[key]
     return {"summary": wer_summary, "speed": speed, "per_sample": per_sample}
 
 
